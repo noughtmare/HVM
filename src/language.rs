@@ -515,3 +515,46 @@ pub fn read_file(code: &str) -> Result<File, String> {
 pub fn read_rule(code: &str) -> Result<Option<Rule>, String> {
   parser::read(Box::new(parse_rule), code)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // TODO avoid importing with glob
+    use proptest::prelude::*;
+
+//    pub enum Term {
+//      Var { name: String },
+//      Dup { nam0: String, nam1: String, expr: BTerm, body: BTerm },
+//      Let { name: String, expr: BTerm, body: BTerm },
+//      Lam { name: String, body: BTerm },
+//      App { func: BTerm, argm: BTerm },
+//      Ctr { name: String, args: Vec<BTerm> },
+//      U32 { numb: u32 },
+//      Op2 { oper: Oper, val0: BTerm, val1: BTerm },
+//    }
+
+    // proptest stuff
+    pub fn any_term() -> impl Strategy<Value = Term> {
+        // TODO include other constructors
+        let leaf = prop_oneof![
+            "[a-z]{1,4}".prop_map(|name| Term::Var { name }),
+            any::<u32>().prop_map(|numb| Term::U32 { numb })
+        ].boxed();
+        leaf.prop_recursive(
+            5, // max depth of recursion
+            50, // max nodes in tree
+            5, // up to 5 items per collection
+            |inner| prop_oneof![
+                ("[A-Z][a-z]{1,4}", prop::collection::vec(inner.clone().prop_map(|val| Box::new(val)), 0..5))
+                    .prop_map(|(name, args)| Term::Ctr { name, args })
+            ])
+    }
+
+    // actual tests
+    proptest! {
+        #[test]
+        fn read_term_to_string_eq_term(t in any_term()) {
+            assert_eq!(*read_term(&t.to_string()).unwrap(), t);
+        }
+    }
+}

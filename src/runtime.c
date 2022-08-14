@@ -155,6 +155,36 @@ typedef struct {
   #endif
 } Worker;
 
+// Logs
+// ----
+
+#define LOG
+#define LOG_FAIL_INDEX 100000
+#ifdef LOG
+#define LOG_SIZE (134217728 * sizeof(Log))
+const u64 LOG_MOVE = 0;
+const u64 LOG_LINK = 1;
+const u64 LOG_FREE = 2;
+const u64 LOG_LOCK = 3;
+const u64 LOG_OPEN = 4;
+typedef struct {
+  u64 x0;
+  u64 x1;
+  u64 x2;
+  u64 x3;
+} Log;
+Log*                 log_data;
+atomic_uint_fast64_t log_size;
+u64 do_log(u64 x0, u64 x1, u64 x2, u64 x3) {
+  u64 index = atomic_fetch_add(&log_size, 1);
+  log_data[index].x0 = x0;
+  log_data[index].x1 = x1;
+  log_data[index].x2 = x2;
+  log_data[index].x3 = x3;
+  return index;
+}
+#endif
+
 // Globals
 // -------
 
@@ -292,10 +322,6 @@ u64 get_num(Ptr lnk) {
   return lnk & 0xFFFFFFFFFFFFFFF;
 }
 
-//u64 get_ari(Ptr lnk) {
-  //return (lnk / ARI) & 0xF;
-//}
-
 u64 get_loc(Ptr lnk, u64 arg) {
   return get_val(lnk) + arg;
 }
@@ -331,6 +357,9 @@ u64 link(Worker* mem, u64 loc, Ptr lnk) {
     mem->node[get_loc(lnk, get_tag(lnk) == DP1 ? 1 : 0)] = Arg(loc);
     //array_write(mem->nodes, get_loc(lnk, get_tag(lnk) == DP1 ? 1 : 0), Arg(loc));
   }
+  #ifdef LOG
+  do_log(LOG_LINK, mem->tid, loc, lnk);
+  #endif
   return lnk;
 }
 
@@ -353,6 +382,7 @@ u64 alloc(Worker* mem, u64 size) {
 // Frees a block of memory by adding its position a freelist
 void clear(Worker* mem, u64 loc, u64 size) {
   stk_push(&mem->free[size], loc);
+  do_log(LOG_FREE, mem->tid, loc, size);
 }
 
 // Garbage Collection
@@ -482,8 +512,18 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
 
   u64 init = 1;
   u32 host = (u32)root;
+  #ifdef LOG
+  u32 last_host = -1;
+  #endif
 
   while (1) {
+
+    #ifdef LOG
+    if (do_log(LOG_MOVE, mem->tid, host, 0) > LOG_FAIL_INDEX) {
+      printf("fail\n");
+      return Num(0);
+    }
+    #endif
 
     u64 term = ask_lnk(mem, host);
 
@@ -517,6 +557,7 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             atomic_flag_clear(((atomic_flag*)(mem->node + get_loc(term,0))) + 6);
             continue;
           }
+          do_log(LOG_LOCK, mem->tid, host, 0);
           #endif
 
           stk_push(&stack, host);
@@ -750,6 +791,7 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
 
           }
           #ifdef PARALLEL
+          do_log(LOG_OPEN, mem->tid, host, 0);
           atomic_flag* flag = ((atomic_flag*)(mem->node + get_loc(term,0))) + 6;
           atomic_flag_clear(flag);
           #endif
@@ -1429,6 +1471,11 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  #ifdef LOG
+  log_size = 0;
+  log_data = (Log*)malloc(LOG_SIZE);
+  #endif
+
   for (u64 tid = 0; tid < MAX_WORKERS; ++tid) {
     workers[tid].aris = id_to_arity_data;
     workers[tid].funs = id_to_arity_size;
@@ -1459,4 +1506,27 @@ int main(int argc, char* argv[]) {
   // Cleanup
   free(code_data);
   free(mem.node);
+
+  #ifdef LOG
+  if (log_size >= LOG_FAIL_INDEX) {
+    printf("LOG = [\n");
+    for (u64 i = 0; i < log_size; ++i) {
+      printf("  ['0x%llx','0x%llx','0x%llx','0x%llx','0x%llx'],\n", i, log_data[i].x0, log_data[i].x1, log_data[i].x2, log_data[i].x3);
+    }
+    printf("];\n");
+
+    printf("NAME = {\n");
+    for (u64 i = 0; i < id_to_name_size; ++i) {
+      printf("  %llu: '%s',\n", i, id_to_name_data[i]);
+    }
+    printf("};\n");
+
+    printf("ARITY = {\n");
+    for (u64 i = 0; i < id_to_arity_size; ++i) {
+      printf("  %llu: %llu,\n", i, id_to_arity_data[i]);
+    }
+    printf("};\n");
+    printf("// failed\n");
+  }
+  #endif
 }

@@ -28,6 +28,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 
 #ifdef PARALLEL
+typedef atomic_uchar a8;
 typedef pthread_t Thd;
 #endif
 
@@ -42,6 +43,10 @@ typedef pthread_t Thd;
 // program starts, we pre-alloc the maximum addressable heap, 32 GB. This will
 // be replaced by a proper arena allocator soon (see the Issues)!
 #define HEAP_SIZE (8 * U64_PER_GB * sizeof(u64))
+
+#ifdef PARALLEL
+#define LOCK_SIZE (8 * U64_PER_GB * sizeof(a8))
+#endif
 
 #ifdef PARALLEL
 #define MAX_WORKERS (/*! GENERATED_NUM_THREADS */ 1 /* GENERATED_NUM_THREADS !*/)
@@ -143,6 +148,8 @@ typedef struct {
   u64  funs;
 
   #ifdef PARALLEL
+  a8*  lock;
+
   u64             has_work;
   pthread_mutex_t has_work_mutex;
   pthread_cond_t  has_work_signal;
@@ -158,7 +165,7 @@ typedef struct {
 // Logs
 // ----
 
-#define LOG
+//#define LOG
 #define LOG_FAIL_INDEX 100000
 #ifdef LOG
 #define LOG_SIZE (134217728 * sizeof(Log))
@@ -382,7 +389,9 @@ u64 alloc(Worker* mem, u64 size) {
 // Frees a block of memory by adding its position a freelist
 void clear(Worker* mem, u64 loc, u64 size) {
   stk_push(&mem->free[size], loc);
+  #ifdef LOG
   do_log(LOG_FREE, mem->tid, loc, size);
+  #endif
 }
 
 // Garbage Collection
@@ -507,14 +516,16 @@ Ptr cal_par(Worker* mem, u64 host, Ptr term, Ptr argn, u64 n) {
 
 // Reduces a term to weak head normal form.
 Ptr reduce(Worker* mem, u64 root, u64 slen) {
+  // stack item:
+  // - host : u30
+  // - lock : u30
+  // - init : u4
+
   Stk stack;
   stk_init(&stack);
 
   u64 init = 1;
-  u32 host = (u32)root;
-  #ifdef LOG
-  u32 last_host = -1;
-  #endif
+  u64 host = (u32)root;
 
   while (1) {
 
@@ -546,18 +557,42 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
         case DP0:
         case DP1: {
           #ifdef PARALLEL
-          // TODO: reason about this, comment
-          atomic_flag* flag = ((atomic_flag*)(mem->node + get_loc(term,0))) + 6;
-          if (atomic_flag_test_and_set(flag) != 0) {
+          
+          // THE DREADED HVM LOCK LOGIC
+          
+          u64 lock_loc = get_loc(term, 0); // location we want to lock
+          unsigned char lock_tid = 0; // thread that locked that location
+
+          // Attempts to lock the location
+          a8* lock_atm = &mem->lock[lock_loc];
+          u64 locked = atomic_compare_exchange_strong(lock_atm, &lock_tid, mem->tid + 1);
+
+          // If we couldn't lock it, and the locker has priority...
+          if (!locked && lock_tid < mem->tid + 1) {
+            // Drop all our stack items...
+            u64 item = stk_pop(&stack);
+            while (item != -1) {
+              atomic_store(&mem->lock[item & 0x7FFFFFFF], 0);
+              item = stk_pop(&stack);
+            };
+            // Wait the locker thread
+            while (!atomic_compare_exchange_strong(lock_atm, &lock_tid, mem->tid + 1)) {};
+            atomic_store(lock_atm, 0);
+            // Go back to root
+            host = root;
             continue;
           }
 
-          // Term changed before we locked
-          if (term != ask_lnk(mem, host)) {
-            atomic_flag_clear(((atomic_flag*)(mem->node + get_loc(term,0))) + 6);
-            continue;
+          // If we locked it, but the link changed...
+          if (ask_lnk(mem, host) != term) {
+            atomic_store(lock_atm, 0); // Release the lock...
+            continue; // Continue walking
           }
+
+          #ifdef LOG
           do_log(LOG_LOCK, mem->tid, host, 0);
+          #endif
+
           #endif
 
           stk_push(&stack, host);
@@ -669,6 +704,9 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
               subst(mem, term_arg_1, Lam(lam1));
               u64 done = Lam(get_tag(term) == DP0 ? lam0 : lam1);
               link(mem, host, done);
+              #ifdef PARALLEL
+              atomic_store(&mem->lock[get_loc(term, 0)], 0);
+              #endif
               init = 1;
               continue;
             }
@@ -693,6 +731,9 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
                 u64 done = link(mem, host, ask_arg(mem, arg0, get_tag(term) == DP0 ? 0 : 1));
                 clear(mem, get_loc(term,0), 3);
                 clear(mem, get_loc(arg0,0), 2);
+                #ifdef PARALLEL
+                atomic_store(&mem->lock[get_loc(term, 0)], 0);
+                #endif
                 init = 1;
                 continue;
               } else {
@@ -713,7 +754,6 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
                 subst(mem, term_arg_1, Par(get_ext(arg0),par1));
                 u64 done = Par(get_ext(arg0), get_tag(term) == DP0 ? par0 : par1);
                 link(mem, host, done);
-                break;
               }
               break;
             }
@@ -785,15 +825,16 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
               subst(mem, ask_arg(mem, term, 1), Era());
               link(mem, host, Era());
               clear(mem, get_loc(term, 0), 3);
+              #ifdef PARALLEL
+              atomic_store(&mem->lock[get_loc(term, 0)], 0);
+              #endif
               init = 1;
               continue;
             }
 
           }
           #ifdef PARALLEL
-          do_log(LOG_OPEN, mem->tid, host, 0);
-          atomic_flag* flag = ((atomic_flag*)(mem->node + get_loc(term,0))) + 6;
-          atomic_flag_clear(flag);
+          atomic_store(&mem->lock[get_loc(term, 0)], 0);
           #endif
           break;
         }
@@ -1105,7 +1146,7 @@ void *worker(void *arg) {
 u64 ffi_cost;
 u64 ffi_size;
 
-void ffi_normal(u8* mem_data, u32 mem_size, u32 host) {
+void ffi_normal(u8* mem_data, a8* mem_lock, u32 mem_size, u32 host) {
 
   // Init thread objects
   for (u64 t = 0; t < MAX_WORKERS; ++t) {
@@ -1118,6 +1159,7 @@ void ffi_normal(u8* mem_data, u32 mem_size, u32 host) {
     workers[t].cost = 0;
     workers[t].dups = MAX_DUPS * t / MAX_WORKERS;
     #ifdef PARALLEL
+    workers[t].lock = (a8*)mem_lock;
     workers[t].has_work = -1;
     pthread_mutex_init(&workers[t].has_work_mutex, NULL);
     pthread_cond_init(&workers[t].has_work_signal, NULL);
@@ -1459,6 +1501,9 @@ int main(int argc, char* argv[]) {
   // Builds main term
   mem.size = 0;
   mem.node = (u64*)malloc(HEAP_SIZE);
+  #ifdef PARALLEL
+  mem.lock = (a8*)malloc(LOCK_SIZE);
+  #endif
   mem.aris = id_to_arity_data;
   mem.funs = id_to_arity_size;
   assert(mem.node);
@@ -1484,7 +1529,7 @@ int main(int argc, char* argv[]) {
   // Reduces and benchmarks
   //printf("Reducing.\n");
   gettimeofday(&start, NULL);
-  ffi_normal((u8*)mem.node, mem.size, 0);
+  ffi_normal((u8*)mem.node, (a8*)mem.lock, mem.size, 0);
   gettimeofday(&stop, NULL);
 
   // Prints result statistics
@@ -1508,25 +1553,25 @@ int main(int argc, char* argv[]) {
   free(mem.node);
 
   #ifdef LOG
-  if (log_size >= LOG_FAIL_INDEX) {
-    printf("LOG = [\n");
-    for (u64 i = 0; i < log_size; ++i) {
-      printf("  ['0x%llx','0x%llx','0x%llx','0x%llx','0x%llx'],\n", i, log_data[i].x0, log_data[i].x1, log_data[i].x2, log_data[i].x3);
-    }
-    printf("];\n");
+  //if (log_size >= LOG_FAIL_INDEX) {
+    //printf("LOG = [\n");
+    //for (u64 i = 0; i < log_size; ++i) {
+      //printf("  ['0x%llx','0x%llx','0x%llx','0x%llx','0x%llx'],\n", i, log_data[i].x0, log_data[i].x1, log_data[i].x2, log_data[i].x3);
+    //}
+    //printf("];\n");
 
-    printf("NAME = {\n");
-    for (u64 i = 0; i < id_to_name_size; ++i) {
-      printf("  %llu: '%s',\n", i, id_to_name_data[i]);
-    }
-    printf("};\n");
+    //printf("NAME = {\n");
+    //for (u64 i = 0; i < id_to_name_size; ++i) {
+      //printf("  %llu: '%s',\n", i, id_to_name_data[i]);
+    //}
+    //printf("};\n");
 
-    printf("ARITY = {\n");
-    for (u64 i = 0; i < id_to_arity_size; ++i) {
-      printf("  %llu: %llu,\n", i, id_to_arity_data[i]);
-    }
-    printf("};\n");
-    printf("// failed\n");
-  }
+    //printf("ARITY = {\n");
+    //for (u64 i = 0; i < id_to_arity_size; ++i) {
+      //printf("  %llu: %llu,\n", i, id_to_arity_data[i]);
+    //}
+    //printf("};\n");
+    //printf("// failed\n");
+  //}
   #endif
 }

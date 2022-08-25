@@ -14,9 +14,9 @@
 (Iter f x n) = (f (Iter f x (- n 1)))
 
 (Fib n) = (Head (Iter 
-    λxs (Cons (SumFirstTwo xs) xs)
-    (Cons 0 (Cons 1 Nil)) 
-    n
+  λxs (Cons (SumFirstTwo xs) xs)
+  (Cons 0 (Cons 1 Nil)) 
+  n
 ))
 
-(Main n) = (Fib 100)
+Main = (Fib 200)

@@ -12,6 +12,8 @@
 
 /*! GENERATED_PARALLEL_FLAG !*/
 
+//#undef PARALLEL
+
 #ifdef PARALLEL
 #include <pthread.h>
 #include <stdatomic.h>
@@ -28,7 +30,8 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 
 #ifdef PARALLEL
-typedef atomic_uchar a8;
+//typedef atomic_uchar a8;
+typedef atomic_flag flg;
 typedef pthread_t Thd;
 #endif
 
@@ -45,7 +48,7 @@ typedef pthread_t Thd;
 #define HEAP_SIZE (8 * U64_PER_GB * sizeof(u64))
 
 #ifdef PARALLEL
-#define LOCK_SIZE (8 * U64_PER_GB * sizeof(a8))
+#define LOCK_SIZE (8 * U64_PER_GB * sizeof(flg))
 #endif
 
 #ifdef PARALLEL
@@ -75,6 +78,7 @@ typedef pthread_t Thd;
 // represents a numeric operation, and NUM and FLO links represent unboxed nums.
 
 typedef u64 Ptr;
+void debug_print_lnk(Ptr x);
 
 #define VAL ((u64) 1)
 #define EXT ((u64) 0x100000000)
@@ -148,7 +152,7 @@ typedef struct {
   u64  funs;
 
   #ifdef PARALLEL
-  a8*  lock;
+  flg* lock;
 
   u64             has_work;
   pthread_mutex_t has_work_mutex;
@@ -354,14 +358,31 @@ Ptr ask_arg(Worker* mem, Ptr term, u64 arg) {
   return ask_lnk(mem, get_loc(term, arg));
 }
 
+// Frees a block of memory by adding its position a freelist
+void clear(Worker* mem, u64 loc, u64 size) {
+  return;
+  //stk_push(&mem->free[size], loc);
+  #ifdef LOG
+  //do_log(LOG_FREE, mem->tid, loc, size);
+  #endif
+}
+
 // This inserts a value in another. It just writes a position in memory if
 // `value` is a constructor. If it is VAR, DP0 or DP1, it also updates the
 // corresponding λ or dup binder.
 u64 link(Worker* mem, u64 loc, Ptr lnk) {
-  mem->node[loc] = lnk;
+  //printf("link %llu <- ", loc); debug_print_lnk(lnk); printf("\n");
   //array_write(mem->nodes, loc, lnk);
-  if (get_tag(lnk) <= VAR) {
-    mem->node[get_loc(lnk, get_tag(lnk) == DP1 ? 1 : 0)] = Arg(loc);
+  mem->node[loc] = lnk;
+  if (UNLIKELY(get_tag(lnk) <= VAR)) {
+    u64 arg_loc = get_loc(lnk, get_tag(lnk) == DP1 ? 1 : 0);
+    u64 arg_lnk = mem->node[arg_loc];
+    if (arg_lnk == 0 || get_tag(arg_lnk) == ARG) {
+      mem->node[arg_loc] = Arg(loc);
+    //} else {
+      //mem->node[loc] = arg_lnk;
+      //clear(mem, arg_loc, 1);
+    }
     //array_write(mem->nodes, get_loc(lnk, get_tag(lnk) == DP1 ? 1 : 0), Arg(loc));
   }
   #ifdef LOG
@@ -384,14 +405,6 @@ u64 alloc(Worker* mem, u64 size) {
     return mem->tid * MEM_SPACE + loc;
     //return __atomic_fetch_add(&mem->nodes->size, size, __ATOMIC_RELAXED);
   }
-}
-
-// Frees a block of memory by adding its position a freelist
-void clear(Worker* mem, u64 loc, u64 size) {
-  stk_push(&mem->free[size], loc);
-  #ifdef LOG
-  do_log(LOG_FREE, mem->tid, loc, size);
-  #endif
 }
 
 // Garbage Collection
@@ -474,13 +487,24 @@ u64 gen_dupk(Worker* mem) {
 // Performs a `x <- value` substitution. It just calls link if the substituted
 // value is a term. If it is an ERA node, that means `value` is now unreachable,
 // so we just call the collector.
-void subst(Worker* mem, Ptr lnk, Ptr val) {
+void subst(Worker* mem, u64 var, Ptr ptr) {
+  u64 lnk = ask_arg(mem, var, 0);
   if (get_tag(lnk) != ERA) {
-    link(mem, get_loc(lnk,0), val);
+    //printf("set %llu = ", var); debug_print_lnk(ptr); printf("\n");
+    mem->node[var] = ptr;
+    //link(mem, get_loc(lnk,0), val);
   } else {
-    collect(mem, val);
+    collect(mem, ptr); // TODO: not thread safe
   }
 }
+
+//void subst(Worker* mem, Ptr lnk, Ptr val) {
+  //if (get_tag(lnk) != ERA) {
+    //link(mem, get_loc(lnk,0), val);
+  //} else {
+    //collect(mem, val);
+  //}
+//}
 
 // (F {a0 a1} b c ...)
 // ------------------- CAL-PAR
@@ -489,12 +513,13 @@ void subst(Worker* mem, Ptr lnk, Ptr val) {
 // ...
 // {(F a0 b0 c0 ...) (F a1 b1 c1 ...)}
 Ptr cal_par(Worker* mem, u64 host, Ptr term, Ptr argn, u64 n) {
+  printf("%llu cal-par\n", mem->tid);
   inc_cost(mem);
   u64 arit = ask_ari(mem, term);
   u64 func = get_ext(term);
-  u64 fun0 = get_loc(term, 0);
+  u64 fun0 = alloc(mem, arit); // GC: get_loc(term, 0)
   u64 fun1 = alloc(mem, arit);
-  u64 par0 = get_loc(argn, 0);
+  u64 par0 = alloc(mem, 2); // GC: get_loc(argn, 0)
   for (u64 i = 0; i < arit; ++i) {
     if (i != n) {
       u64 leti = alloc(mem, 3);
@@ -527,7 +552,12 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
   u64 init = 1;
   u64 host = (u32)root;
 
+  u64 locks = 0;
+
   while (1) {
+    //if (++count > 20) {
+      //exit(0);
+    //}
 
     #ifdef LOG
     if (do_log(LOG_MOVE, mem->tid, host, 0) > LOG_FAIL_INDEX) {
@@ -538,7 +568,7 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
 
     u64 term = ask_lnk(mem, host);
 
-    //printf("reduce "); debug_print_lnk(term); printf("\n");
+    printf("%llu reduce ", mem->tid); debug_print_lnk(term); printf(" (%llu)\n", init);
     //printf("------\n");
     //printf("reducing: host=%d size=%llu init=%llu ", host, stack.size, init); debug_print_lnk(term); printf("\n");
     //for (u64 i = 0; i < 256; ++i) {
@@ -550,54 +580,37 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
         case APP: {
           stk_push(&stack, host);
           //stack[size++] = host;
-          init = 1;
           host = get_loc(term, 0);
           continue;
         }
-        case DP0:
-        case DP1: {
-          #ifdef PARALLEL
-          
-          // THE DREADED HVM LOCK LOGIC
-          
-          u64 lock_loc = get_loc(term, 0); // location we want to lock
-          unsigned char lock_tid = 0; // thread that locked that location
-
-          // Attempts to lock the location
-          a8* lock_atm = &mem->lock[lock_loc];
-          u64 locked = atomic_compare_exchange_strong(lock_atm, &lock_tid, mem->tid + 1);
-
-          // If we couldn't lock it, and the locker has priority...
-          if (!locked && lock_tid < mem->tid + 1) {
-            // Drop all our stack items...
-            u64 item = stk_pop(&stack);
-            while (item != -1) {
-              atomic_store(&mem->lock[item & 0x7FFFFFFF], 0);
-              item = stk_pop(&stack);
-            };
-            // Wait the locker thread
-            while (!atomic_compare_exchange_strong(lock_atm, &lock_tid, mem->tid + 1)) {};
-            atomic_store(lock_atm, 0);
-            // Go back to root
-            host = root;
+        case DP0: case DP1: {
+          u64 bind = ask_arg(mem, term, get_tag(term) == DP0 ? 0 : 1);
+          if (get_tag(bind) != ARG) {
+            printf("dup-sub\n");
+            link(mem, host, bind);
+            clear(mem, get_loc(term, 0), 1);
+            continue;
+          } else {
+            #ifdef PARALLEL
+            u64 lock_loc = get_loc(term, 0);
+            flg lock_flg = mem->lock[lock_loc];
+            if (atomic_flag_test_and_set(&lock_flg) != 0) {
+              printf("%llu couldn't lock %llu\n", mem->tid, lock_loc);
+              init = 1;
+              exit(0);
+              continue;
+            }
+            if (ask_lnk(mem, host) != term) {
+              printf("%llu bad %llu\n", mem->tid, lock_loc);
+              exit(0);
+            }
+            ++locks;
+            printf("%llu locks %llu\n", mem->tid, lock_loc);
+            #endif
+            stk_push(&stack, host);
+            host = get_loc(term, 2);
             continue;
           }
-
-          // If we locked it, but the link changed...
-          if (ask_lnk(mem, host) != term) {
-            atomic_store(lock_atm, 0); // Release the lock...
-            continue; // Continue walking
-          }
-
-          #ifdef LOG
-          do_log(LOG_LOCK, mem->tid, host, 0);
-          #endif
-
-          #endif
-
-          stk_push(&stack, host);
-          host = get_loc(term, 2);
-          continue;
         }
         case OP2: {
           if (slen == 1 || stack.size > 0) {
@@ -623,6 +636,16 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
 
           break;
         }
+        case VAR: {
+          u64 bind = ask_arg(mem, term, 0);
+          if (get_tag(bind) != ARG) {
+            printf("var-sub\n");
+            link(mem, host, bind);
+            clear(mem, get_loc(term, 0), 1);
+            continue;
+          }
+          break;
+        }
       }
 
     } else {
@@ -637,9 +660,9 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // x <- a
             // body
             case LAM: {
-              //printf("app-lam\n");
+              printf("%llu app-lam\n", mem->tid);
               inc_cost(mem);
-              subst(mem, ask_arg(mem, arg0, 0), ask_arg(mem, term, 1));
+              subst(mem, get_loc(arg0, 0), ask_arg(mem, term, 1));
               u64 done = link(mem, host, ask_arg(mem, arg0, 1));
               clear(mem, get_loc(term,0), 2);
               clear(mem, get_loc(arg0,0), 2);
@@ -652,10 +675,10 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // dup x0 x1 = c
             // {(a x0) (b x1)}
             case PAR: {
-              //printf("app-sup\n");
+              printf("%llu app-sup\n", mem->tid);
               inc_cost(mem);
-              u64 app0 = get_loc(term, 0);
-              u64 app1 = get_loc(arg0, 0);
+              u64 app0 = alloc(mem, 2); // GC: get_loc(term, 0);
+              u64 app1 = alloc(mem, 2); // GC: get_loc(arg0, 0);
               u64 let0 = alloc(mem, 3);
               u64 par0 = alloc(mem, 2);
               link(mem, let0+2, ask_arg(mem, term, 1));
@@ -685,27 +708,26 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // s <- λx1(f1)
             // x <- {x0 x1}
             case LAM: {
-              //printf("dup-lam\n");
+              printf("%llu dup-lam\n", mem->tid);
               inc_cost(mem);
-              u64 let0 = get_loc(term, 0);
-              u64 par0 = get_loc(arg0, 0);
+              u64 let0 = alloc(mem, 3); // GC: get_loc(term, 0);
+              u64 par0 = alloc(mem, 2); // GC: get_loc(arg0, 0);
               u64 lam0 = alloc(mem, 2);
               u64 lam1 = alloc(mem, 2);
               link(mem, let0+2, ask_arg(mem, arg0, 1));
               link(mem, par0+1, Var(lam1));
-              u64 arg0_arg_0 = ask_arg(mem, arg0, 0);
               link(mem, par0+0, Var(lam0));
-              subst(mem, arg0_arg_0, Par(get_ext(term), par0));
-              u64 term_arg_0 = ask_arg(mem,term,0);
+              subst(mem, get_loc(arg0, 0), Par(get_ext(term), par0));
               link(mem, lam0+1, Dp0(get_ext(term), let0));
-              subst(mem, term_arg_0, Lam(lam0));
-              u64 term_arg_1 = ask_arg(mem,term,1);
+              subst(mem, get_loc(term, 0), Lam(lam0));
               link(mem, lam1+1, Dp1(get_ext(term), let0));
-              subst(mem, term_arg_1, Lam(lam1));
+              subst(mem, get_loc(term, 1), Lam(lam1));
               u64 done = Lam(get_tag(term) == DP0 ? lam0 : lam1);
               link(mem, host, done);
               #ifdef PARALLEL
-              atomic_store(&mem->lock[get_loc(term, 0)], 0);
+              --locks;
+              printf("%llu unlocks %llu\n", mem->tid, get_loc(term, 0));
+              atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
               #endif
               init = 1;
               continue;
@@ -723,35 +745,35 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // dup xA yA = a
             // dup xB yB = b
             case PAR: {
-              //printf("dup-sup\n");
+              printf("%llu dup-sup\n", mem->tid);
               if (get_ext(term) == get_ext(arg0)) {
                 inc_cost(mem);
-                subst(mem, ask_arg(mem,term,0), ask_arg(mem,arg0,0));
-                subst(mem, ask_arg(mem,term,1), ask_arg(mem,arg0,1));
+                subst(mem, get_loc(term, 0), ask_arg(mem, arg0, 0));
+                subst(mem, get_loc(term, 1), ask_arg(mem, arg0, 1));
                 u64 done = link(mem, host, ask_arg(mem, arg0, get_tag(term) == DP0 ? 0 : 1));
                 clear(mem, get_loc(term,0), 3);
                 clear(mem, get_loc(arg0,0), 2);
-                #ifdef PARALLEL
-                atomic_store(&mem->lock[get_loc(term, 0)], 0);
-                #endif
                 init = 1;
+                #ifdef PARALLEL
+                --locks;
+                printf("%llu unlocks %llu\n", mem->tid, get_loc(term, 0));
+                atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
+                #endif
                 continue;
               } else {
                 inc_cost(mem);
                 u64 par0 = alloc(mem, 2);
-                u64 let0 = get_loc(term,0);
-                u64 par1 = get_loc(arg0,0);
+                u64 let0 = alloc(mem, 3); // GC: get_loc(term,0);
+                u64 par1 = alloc(mem, 2); // GC: get_loc(arg0,0);
                 u64 let1 = alloc(mem, 3);
                 link(mem, let0+2, ask_arg(mem,arg0,0));
                 link(mem, let1+2, ask_arg(mem,arg0,1));
-                u64 term_arg_0 = ask_arg(mem,term,0);
-                u64 term_arg_1 = ask_arg(mem,term,1);
                 link(mem, par1+0, Dp1(get_ext(term),let0));
                 link(mem, par1+1, Dp1(get_ext(term),let1));
                 link(mem, par0+0, Dp0(get_ext(term),let0));
                 link(mem, par0+1, Dp0(get_ext(term),let1));
-                subst(mem, term_arg_0, Par(get_ext(arg0),par0));
-                subst(mem, term_arg_1, Par(get_ext(arg0),par1));
+                subst(mem, get_loc(term, 0), Par(get_ext(arg0),par0));
+                subst(mem, get_loc(term, 1), Par(get_ext(arg0),par1));
                 u64 done = Par(get_ext(arg0), get_tag(term) == DP0 ? par0 : par1);
                 link(mem, host, done);
               }
@@ -764,10 +786,10 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // y <- N
             // ~
             case NUM: {
-              //printf("dup-u32\n");
+              printf("%llu dup-u32\n", mem->tid);
               inc_cost(mem);
-              subst(mem, ask_arg(mem,term,0), arg0);
-              subst(mem, ask_arg(mem,term,1), arg0);
+              subst(mem, get_loc(term, 0), arg0);
+              subst(mem, get_loc(term, 1), arg0);
               clear(mem, get_loc(term,0), 3);
               u64 done = arg0;
               link(mem, host, arg0);
@@ -783,17 +805,17 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // x <- (K a0 b0 c0 ...)
             // y <- (K a1 b1 c1 ...)
             case CTR: {
-              //printf("dup-ctr\n");
+              printf("%llu dup-ctr\n", mem->tid);
               inc_cost(mem);
               u64 func = get_ext(arg0);
               u64 arit = ask_ari(mem, arg0);
               if (arit == 0) {
-                subst(mem, ask_arg(mem,term,0), Ctr(0, func, 0));
-                subst(mem, ask_arg(mem,term,1), Ctr(0, func, 0));
+                subst(mem, get_loc(term, 0), Ctr(0, func, 0));
+                subst(mem, get_loc(term, 1), Ctr(0, func, 0));
                 clear(mem, get_loc(term,0), 3);
                 u64 done = link(mem, host, Ctr(0, func, 0));
               } else {
-                u64 ctr0 = get_loc(arg0,0);
+                u64 ctr0 = alloc(mem, arit); // GC: get_loc(arg0,0);
                 u64 ctr1 = alloc(mem, arit);
                 for (u64 i = 0; i < arit - 1; ++i) {
                   u64 leti = alloc(mem, 3);
@@ -801,14 +823,12 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
                   link(mem, ctr0+i, Dp0(get_ext(term), leti));
                   link(mem, ctr1+i, Dp1(get_ext(term), leti));
                 }
-                u64 leti = get_loc(term, 0);
+                u64 leti = alloc(mem, 3); // GC: get_loc(term, 0);
                 link(mem, leti + 2, ask_arg(mem, arg0, arit - 1));
-                u64 term_arg_0 = ask_arg(mem, term, 0);
                 link(mem, ctr0 + arit - 1, Dp0(get_ext(term), leti));
-                subst(mem, term_arg_0, Ctr(arit, func, ctr0));
-                u64 term_arg_1 = ask_arg(mem, term, 1);
+                subst(mem, get_loc(term, 0), Ctr(arit, func, ctr0));
                 link(mem, ctr1 + arit - 1, Dp1(get_ext(term), leti));
-                subst(mem, term_arg_1, Ctr(arit, func, ctr1));
+                subst(mem, get_loc(term, 1), Ctr(arit, func, ctr1));
                 u64 done = Ctr(arit, func, get_tag(term) == DP0 ? ctr0 : ctr1);
                 link(mem, host, done);
               }
@@ -821,20 +841,25 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // y <- *
             case ERA: {
               inc_cost(mem);
-              subst(mem, ask_arg(mem, term, 0), Era());
-              subst(mem, ask_arg(mem, term, 1), Era());
+              subst(mem, get_loc(term, 0), Era());
+              subst(mem, get_loc(term, 1), Era());
               link(mem, host, Era());
               clear(mem, get_loc(term, 0), 3);
               #ifdef PARALLEL
-              atomic_store(&mem->lock[get_loc(term, 0)], 0);
+              --locks;
+              printf("%llu unlocks %llu\n", mem->tid, get_loc(term, 0));
+              atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
               #endif
               init = 1;
               continue;
             }
 
           }
+
           #ifdef PARALLEL
-          atomic_store(&mem->lock[get_loc(term, 0)], 0);
+          --locks;
+          printf("%llu unlocks %llu\n", mem->tid, get_loc(term, 0));
+          atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
           #endif
           break;
         }
@@ -846,7 +871,7 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
           // --------- OP2-NUM
           // add(a, b)
           if (get_tag(arg0) == NUM && get_tag(arg1) == NUM) {
-            //printf("op2-u32\n");
+            printf("%llu op2-u32\n", mem->tid);
             inc_cost(mem);
             u64 a = get_num(arg0);
             u64 b = get_num(arg1);
@@ -879,10 +904,10 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
           // let b0 b1 = b
           // {(+ a0 b0) (+ a1 b1)}
           else if (get_tag(arg0) == PAR) {
-            //printf("op2-sup-0\n");
+            printf("%llu op2-sup-0\n", mem->tid);
             inc_cost(mem);
-            u64 op20 = get_loc(term, 0);
-            u64 op21 = get_loc(arg0, 0);
+            u64 op20 = alloc(mem, 2); // GC: get_loc(term, 0);
+            u64 op21 = alloc(mem, 2); // GC: get_loc(arg0, 0);
             u64 let0 = alloc(mem, 3);
             u64 par0 = alloc(mem, 2);
             link(mem, let0+2, arg1);
@@ -901,10 +926,10 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
           // dup a0 a1 = a
           // {(+ a0 b0) (+ a1 b1)}
           else if (get_tag(arg1) == PAR) {
-            //printf("op2-sup-1\n");
+            printf("%llu op2-sup-1\n", mem->tid);
             inc_cost(mem);
-            u64 op20 = get_loc(term, 0);
-            u64 op21 = get_loc(arg1, 0);
+            u64 op20 = alloc(mem, 2); // GC: get_loc(term, 0);
+            u64 op21 = alloc(mem, 2); // GC: get_loc(arg1, 0);
             u64 let0 = alloc(mem, 3);
             u64 par0 = alloc(mem, 2);
             link(mem, let0+2, arg0);
@@ -946,6 +971,8 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
     }
 
   }
+
+  printf("%llu returns locks=%llu\n", mem->tid, locks);
 
   return ask_lnk(mem, root);
 }
@@ -1146,7 +1173,11 @@ void *worker(void *arg) {
 u64 ffi_cost;
 u64 ffi_size;
 
-void ffi_normal(u8* mem_data, a8* mem_lock, u32 mem_size, u32 host) {
+#ifdef PARALLEL
+void ffi_normal(u8* mem_data, flg* mem_lock, u32 mem_size, u32 host) {
+#else
+void ffi_normal(u8* mem_data, u32 mem_size, u32 host) {
+#endif
 
   // Init thread objects
   for (u64 t = 0; t < MAX_WORKERS; ++t) {
@@ -1159,7 +1190,7 @@ void ffi_normal(u8* mem_data, a8* mem_lock, u32 mem_size, u32 host) {
     workers[t].cost = 0;
     workers[t].dups = MAX_DUPS * t / MAX_WORKERS;
     #ifdef PARALLEL
-    workers[t].lock = (a8*)mem_lock;
+    workers[t].lock = (flg*)mem_lock;
     workers[t].has_work = -1;
     pthread_mutex_init(&workers[t].has_work_mutex, NULL);
     pthread_cond_init(&workers[t].has_work_signal, NULL);
@@ -1346,7 +1377,6 @@ void readback_term(Stk* chrs, Worker* mem, Ptr term, Stk* vars, Stk* dirs, char*
     }
     case OP2: {
       stk_push(chrs, '(');
-      readback_term(chrs, mem, ask_arg(mem, term, 0), vars, dirs, id_to_name_data, id_to_name_mcap);
       switch (get_ext(term)) {
         case ADD: { stk_push(chrs, '+'); break; }
         case SUB: { stk_push(chrs, '-'); break; }
@@ -1365,6 +1395,9 @@ void readback_term(Stk* chrs, Worker* mem, Ptr term, Stk* vars, Stk* dirs, char*
         case GTN: { stk_push(chrs, '>'); break; }
         case NEQ: { stk_push(chrs, '!'); stk_push(chrs, '='); break; }
       }
+      stk_push(chrs, ' ');
+      readback_term(chrs, mem, ask_arg(mem, term, 0), vars, dirs, id_to_name_data, id_to_name_mcap);
+      stk_push(chrs, ' ');
       readback_term(chrs, mem, ask_arg(mem, term, 1), vars, dirs, id_to_name_data, id_to_name_mcap);
       stk_push(chrs, ')');
       break;
@@ -1502,7 +1535,7 @@ int main(int argc, char* argv[]) {
   mem.size = 0;
   mem.node = (u64*)malloc(HEAP_SIZE);
   #ifdef PARALLEL
-  mem.lock = (a8*)malloc(LOCK_SIZE);
+  mem.lock = (flg*)malloc(LOCK_SIZE);
   #endif
   mem.aris = id_to_arity_data;
   mem.funs = id_to_arity_size;
@@ -1529,7 +1562,11 @@ int main(int argc, char* argv[]) {
   // Reduces and benchmarks
   //printf("Reducing.\n");
   gettimeofday(&start, NULL);
-  ffi_normal((u8*)mem.node, (a8*)mem.lock, mem.size, 0);
+  #ifdef PARALLEL
+  ffi_normal((u8*)mem.node, (flg*)mem.lock, mem.size, 0);
+  #else
+  ffi_normal((u8*)mem.node, mem.size, 0);
+  #endif
   gettimeofday(&stop, NULL);
 
   // Prints result statistics

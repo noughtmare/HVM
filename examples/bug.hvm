@@ -13,10 +13,28 @@
 (Iter f x 0) = x
 (Iter f x n) = (f (Iter f x (- n 1)))
 
+//(Fib 0) = 0
 (Fib n) = (Head (Iter 
   λxs (Cons (SumFirstTwo xs) xs)
   (Cons 0 (Cons 1 Nil)) 
   n
 ))
 
-Main = (Fib 200)
+
+//(Pair 0 0) = (PAIR 0 0)
+//(Pair a b) = (PAIR a b)
+//(Foo x) = (Bar x x)
+
+//Main = (λx(Bar (x 2) (x 3)) λx(+ x 1))
+Main = (Fib 10)
+
+//(F a b) = (+ a b)
+
+//Main =
+  //let x = [1 2 3]
+  //(Pair x x)
+
+
+
+
+

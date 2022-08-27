@@ -1,12 +1,12 @@
 // List type
 (Head (Cons x xs)) = (Some x)
-(Head Nil) = None
+(Head Nil)         = None
 
 // Something like Rust's Option.unwrap_or
 (UnwrapOr (Some x) y) = x
-(UnwrapOr None y) = y
+(UnwrapOr None     y) = y
 
-(SumFirstTwo Nil) = 0 
+(SumFirstTwo Nil)         = 0 
 (SumFirstTwo (Cons x xs)) = (+ x (UnwrapOr (Head xs) 0))
 
 // Iterate a function n times on an input
@@ -23,10 +23,23 @@
 
 //(Pair 0 0) = (PAIR 0 0)
 //(Pair a b) = (PAIR a b)
-//(Foo x) = (Bar x x)
+(Foo x) = (Bar x x)
 
-//Main = (λx(Bar (x 2) (x 3)) λx(+ x 1))
-Main = (Fib 10)
+//Main = (Fib 10000)
+//Main = (Fib 10)
+
+Main = (λfλx(f (f x)) λfλx(f (f x)))
+
+//(Main n) = (λxλy(y) λz(Foo z) 8)
+
+//Main =
+  //let ab = (+ $x 1);
+  //(Ctr ab ((λ$x 7) 8) ab)
+
+//Main = (λx(x) 7)
+
+//535601498209671957
+//535601498209671957
 
 //(F a b) = (+ a b)
 

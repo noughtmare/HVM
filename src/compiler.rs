@@ -185,7 +185,7 @@ fn compile_func(comp: &rb::RuleBook, fn_name: &str, rules: &[lang::Rule], tab: u
     // Builds the right-hand side term (ex: `(Succ (Add a b))`)
     //let done = compile_func_rule_body(&mut code, tab + 1, &dynrule.body, &dynrule.vars);
     let done = compile_func_rule_term(&mut code, tab + 1, &dynrule.term, &dynrule.vars);
-    line(&mut code, tab + 1, &format!("u64 done = {};", done));
+    line(&mut code, tab + 1, &format!("Ptr done = {};", done));
 
     // Links the host location to it
     line(&mut code, tab + 1, "link(mem, host, done);");
@@ -275,9 +275,9 @@ fn compile_func_rule_term(
         let dup0 = fresh(nams, "dp0");
         let dup1 = fresh(nams, "dp1");
         let expr = compile_term(code, tab, vars, nams, globs, expr);
-        line(code, tab, &format!("u64 {} = {};", copy, expr));
-        line(code, tab, &format!("u64 {};", dup0));
-        line(code, tab, &format!("u64 {};", dup1));
+        line(code, tab, &format!("Ptr {} = {};", copy, expr));
+        line(code, tab, &format!("Ptr {};", dup0));
+        line(code, tab, &format!("Ptr {};", dup1));
         if INLINE_NUMBERS {
           line(code, tab + 0, &format!("if (get_tag({}) == NUM) {{", copy));
           line(code, tab + 1, "inc_cost(mem);");
@@ -293,9 +293,13 @@ fn compile_func_rule_term(
         line(code, tab + 1, &format!("u64 {} = gen_dupk(mem);", coln));
         if eras.0 {
           line(code, tab + 1, &format!("link(mem, {} + 0, Era());", name));
+        } else {
+          line(code, tab + 1, &format!("link(mem, {} + 0, Arg(0));", name));
         }
         if eras.1 {
           line(code, tab + 1, &format!("link(mem, {} + 1, Era());", name));
+        } else {
+          line(code, tab + 1, &format!("link(mem, {} + 1, Arg(0));", name));
         }
         line(code, tab + 1, &format!("link(mem, {} + 2, {});", name, copy));
         line(code, tab + 1, &format!("{} = Dp0({}, {});", dup0, coln, name));
@@ -324,6 +328,8 @@ fn compile_func_rule_term(
         vars.pop();
         if *eras {
           line(code, tab, &format!("link(mem, {} + 0, Era());", name));
+        } else {
+          line(code, tab, &format!("link(mem, {} + 0, Arg(0));", name));
         }
         line(code, tab, &format!("link(mem, {} + 1, {});", name, body));
         format!("Lam({})", name)
@@ -365,7 +371,7 @@ fn compile_func_rule_term(
         let name = fresh(nams, "op2");
         let val0 = compile_term(code, tab, vars, nams, globs, val0);
         let val1 = compile_term(code, tab, vars, nams, globs, val1);
-        line(code, tab + 0, &format!("u64 {};", retx));
+        line(code, tab + 0, &format!("Ptr {};", retx));
         // Optimization: do inline operation, avoiding Op2 allocation, when operands are already number
         if INLINE_NUMBERS {
           line(

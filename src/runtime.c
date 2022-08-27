@@ -12,7 +12,7 @@
 
 /*! GENERATED_PARALLEL_FLAG !*/
 
-//#undef PARALLEL
+#undef PARALLEL
 
 #ifdef PARALLEL
 #include <pthread.h>
@@ -30,10 +30,18 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 
 #ifdef PARALLEL
-//typedef atomic_uchar a8;
+typedef atomic_uchar a8;
+typedef atomic_ullong a64;
 typedef atomic_flag flg;
 typedef pthread_t Thd;
 #endif
+
+// Debug
+// -----
+
+void err() {
+  exit(EXIT_FAILURE);
+}
 
 // Consts
 // ------
@@ -77,7 +85,11 @@ typedef pthread_t Thd;
 // Some links deal with variables: DP0, DP1, VAR, ARG and ERA.  The OP2 link
 // represents a numeric operation, and NUM and FLO links represent unboxed nums.
 
+#ifdef PARALLEL
+typedef a64 Ptr;
+#else
 typedef u64 Ptr;
+#endif
 void debug_print_lnk(Ptr x);
 
 #define VAL ((u64) 1)
@@ -154,47 +166,17 @@ typedef struct {
   #ifdef PARALLEL
   flg* lock;
 
-  u64             has_work;
+  a64             has_work;
   pthread_mutex_t has_work_mutex;
   pthread_cond_t  has_work_signal;
 
-  u64             has_result;
+  Ptr             has_result;
   pthread_mutex_t has_result_mutex;
   pthread_cond_t  has_result_signal;
 
   Thd  thread;
   #endif
 } Worker;
-
-// Logs
-// ----
-
-//#define LOG
-#define LOG_FAIL_INDEX 100000
-#ifdef LOG
-#define LOG_SIZE (134217728 * sizeof(Log))
-const u64 LOG_MOVE = 0;
-const u64 LOG_LINK = 1;
-const u64 LOG_FREE = 2;
-const u64 LOG_LOCK = 3;
-const u64 LOG_OPEN = 4;
-typedef struct {
-  u64 x0;
-  u64 x1;
-  u64 x2;
-  u64 x3;
-} Log;
-Log*                 log_data;
-atomic_uint_fast64_t log_size;
-u64 do_log(u64 x0, u64 x1, u64 x2, u64 x3) {
-  u64 index = atomic_fetch_add(&log_size, 1);
-  log_data[index].x0 = x0;
-  log_data[index].x1 = x1;
-  log_data[index].x2 = x2;
-  log_data[index].x3 = x3;
-  return index;
-}
-#endif
 
 // Globals
 // -------
@@ -340,55 +322,61 @@ u64 get_loc(Ptr lnk, u64 arg) {
 u64 ask_ari(Worker* mem, Ptr lnk) {
   u64 fid = get_ext(lnk);
   u64 got = fid < mem->funs ? mem->aris[fid] : 0;
-  // TODO: remove this in a future update where ari will be removed from the lnk
-  //if (get_ari(lnk) != got) {
-    //printf("[ERROR] arity inconsistency\n");
-    //exit(1);
-  //}
   return got;
 }
 
-// Dereferences a Ptr, getting what is stored on its target position
+// Gets what is stored on the location
 Ptr ask_lnk(Worker* mem, u64 loc) {
   return mem->node[loc];
 }
 
-// Dereferences the nth argument of the Term represented by this Ptr
+// Gets the nth slot of the node that this Ptr points to
 Ptr ask_arg(Worker* mem, Ptr term, u64 arg) {
-  return ask_lnk(mem, get_loc(term, arg));
+  if (LIKELY(get_tag(term) > VAR)) {
+    return ask_lnk(mem, get_loc(term, arg));
+  }
+  printf("ERROR: ask_arg called on variable!\n"); // FIXME: remove this sanity check
+  err();
+  return 0;
+}
+
+// Gets what is stored on the location, atomically
+Ptr atomic_ask_lnk(Worker* mem, u64 loc) {
+  #ifdef PARALLEL
+  return atomic_load(&mem->node[loc]); // FIXME: add memory_order
+  #else
+  return mem->node[loc];
+  #endif
+}
+
+// Gets the nth slot of the LAM/DUP node that this VAR/DP0/DP1 Ptr points to, atomically
+Ptr atomic_ask_arg(Worker* mem, Ptr term, u64 arg) {
+  if (LIKELY(get_tag(term) <= VAR)) {
+    return atomic_ask_lnk(mem, get_loc(term, arg));
+  }
+  printf("ERROR: atomic_ask_lnk called on non-variable!\n"); // FIXME: remove this sanity check
+  err();
+  return 0;
 }
 
 // Frees a block of memory by adding its position a freelist
 void clear(Worker* mem, u64 loc, u64 size) {
-  return;
   //stk_push(&mem->free[size], loc);
-  #ifdef LOG
-  //do_log(LOG_FREE, mem->tid, loc, size);
-  #endif
 }
 
-// This inserts a value in another. It just writes a position in memory if
-// `value` is a constructor. If it is VAR, DP0 or DP1, it also updates the
-// corresponding λ or dup binder.
-u64 link(Worker* mem, u64 loc, Ptr lnk) {
-  //printf("link %llu <- ", loc); debug_print_lnk(lnk); printf("\n");
-  //array_write(mem->nodes, loc, lnk);
-  mem->node[loc] = lnk;
-  if (UNLIKELY(get_tag(lnk) <= VAR)) {
-    u64 arg_loc = get_loc(lnk, get_tag(lnk) == DP1 ? 1 : 0);
-    u64 arg_lnk = mem->node[arg_loc];
-    if (arg_lnk == 0 || get_tag(arg_lnk) == ARG) {
-      mem->node[arg_loc] = Arg(loc);
-    //} else {
-      //mem->node[loc] = arg_lnk;
-      //clear(mem, arg_loc, 1);
-    }
-    //array_write(mem->nodes, get_loc(lnk, get_tag(lnk) == DP1 ? 1 : 0), Arg(loc));
-  }
-  #ifdef LOG
-  do_log(LOG_LINK, mem->tid, loc, lnk);
-  #endif
-  return lnk;
+void clear_lam(Worker* mem, u64 loc) {
+  // FIXME: uncomment
+  //if (get_tag(atomic_ask_lnk(get_loc(arg0, 0))) == ERA) {
+    //clear(mem, get_loc(term,0), 2);
+  //}
+}
+
+void clear_dup(Worker* mem, u64 loc) {
+}
+
+// Inserts a value in another.
+Ptr link(Worker* mem, u64 loc, Ptr lnk) {
+  return mem->node[loc] = lnk;
 }
 
 // Allocates a block of memory, up to 16 words long
@@ -418,25 +406,27 @@ u64 alloc(Worker* mem, u64 size) {
 // uncommenting the `reduce` lines below, but this would make HVM not 100% lazy
 // in some cases, so it should be called in a separate thread.
 void collect(Worker* mem, Ptr term) {
+  return;
   switch (get_tag(term)) {
-    case DP0: {
-      link(mem, get_loc(term,0), Era());
-      //reduce(mem, get_loc(ask_arg(mem,term,1),0));
-      break;
-    }
-    case DP1: {
-      link(mem, get_loc(term,1), Era());
-      //reduce(mem, get_loc(ask_arg(mem,term,0),0));
-      break;
-    }
-    case VAR: {
-      link(mem, get_loc(term,0), Era());
+    case VAR: case DP0: case DP1: {
+      u64 arg_loc = get_loc(term, get_tag(term) == DP1 ? 1 : 0);
+      #ifdef PARALLEL
+      u64 arg_val = (ARG*TAG); // FIXME: should Ptr be just u64?
+      if (!atomic_compare_exchange_strong(&mem->node[arg_loc], &arg_val, (ERA*TAG))) {
+        collect(mem, arg_val);
+      }
+      #else
+      Ptr arg_val = mem->node[arg_loc];
+      if (arg_val != Era()) {
+        collect(mem, arg_val);
+      } else {
+        mem->node[arg_loc] = Era();
+      }
+      #endif
       break;
     }
     case LAM: {
-      if (get_tag(ask_arg(mem,term,0)) != ERA) {
-        link(mem, get_loc(ask_arg(mem,term,0),0), Era());
-      }
+      collect(mem, ask_arg(mem,term,0));
       collect(mem, ask_arg(mem,term,1));
       clear(mem, get_loc(term,0), 2);
       break;
@@ -460,6 +450,12 @@ void collect(Worker* mem, Ptr term) {
       break;
     }
     case NUM: {
+      break;
+    }
+    case ARG: {
+      break;
+    }
+    case ERA: {
       break;
     }
     case CTR: case CAL: {
@@ -488,13 +484,17 @@ u64 gen_dupk(Worker* mem) {
 // value is a term. If it is an ERA node, that means `value` is now unreachable,
 // so we just call the collector.
 void subst(Worker* mem, u64 var, Ptr ptr) {
-  u64 lnk = ask_arg(mem, var, 0);
+  Ptr lnk = atomic_ask_lnk(mem, var);
   if (get_tag(lnk) != ERA) {
     //printf("set %llu = ", var); debug_print_lnk(ptr); printf("\n");
+    #ifdef PARALLEL
+    atomic_store(&mem->node[var], ptr);
+    #else
     mem->node[var] = ptr;
+    #endif
     //link(mem, get_loc(lnk,0), val);
   } else {
-    collect(mem, ptr); // TODO: not thread safe
+    collect(mem, ptr);
   }
 }
 
@@ -513,7 +513,7 @@ void subst(Worker* mem, u64 var, Ptr ptr) {
 // ...
 // {(F a0 b0 c0 ...) (F a1 b1 c1 ...)}
 Ptr cal_par(Worker* mem, u64 host, Ptr term, Ptr argn, u64 n) {
-  printf("%llu cal-par\n", mem->tid);
+  //printf("%llu cal-par %llu\n", mem->tid, mem->cost);
   inc_cost(mem);
   u64 arit = ask_ari(mem, term);
   u64 func = get_ext(term);
@@ -523,9 +523,11 @@ Ptr cal_par(Worker* mem, u64 host, Ptr term, Ptr argn, u64 n) {
   for (u64 i = 0; i < arit; ++i) {
     if (i != n) {
       u64 leti = alloc(mem, 3);
-      u64 argi = ask_arg(mem, term, i);
+      Ptr argi = ask_arg(mem, term, i);
       link(mem, fun0+i, Dp0(get_ext(argn), leti));
       link(mem, fun1+i, Dp1(get_ext(argn), leti));
+      link(mem, leti+0, Arg(0));
+      link(mem, leti+1, Arg(0));
       link(mem, leti+2, argi);
     } else {
       link(mem, fun0+i, ask_arg(mem, argn, 0));
@@ -534,41 +536,25 @@ Ptr cal_par(Worker* mem, u64 host, Ptr term, Ptr argn, u64 n) {
   }
   link(mem, par0+0, Cal(arit, func, fun0));
   link(mem, par0+1, Cal(arit, func, fun1));
-  u64 done = Par(get_ext(argn), par0);
+  Ptr done = Par(get_ext(argn), par0);
   link(mem, host, done);
+  clear(mem, get_loc(term, 0), arit);
+  clear(mem, get_loc(argn, 0), 2);
   return done;
 }
 
 // Reduces a term to weak head normal form.
 Ptr reduce(Worker* mem, u64 root, u64 slen) {
-  // stack item:
-  // - host : u30
-  // - lock : u30
-  // - init : u4
-
   Stk stack;
   stk_init(&stack);
 
   u64 init = 1;
   u64 host = (u32)root;
 
-  u64 locks = 0;
-
   while (1) {
-    //if (++count > 20) {
-      //exit(0);
+    Ptr term = ask_lnk(mem, host);
+    //printf("%llu reduce %llu ", mem->tid, host); debug_print_lnk(term); printf(" (%llu)\n", init);
     //}
-
-    #ifdef LOG
-    if (do_log(LOG_MOVE, mem->tid, host, 0) > LOG_FAIL_INDEX) {
-      printf("fail\n");
-      return Num(0);
-    }
-    #endif
-
-    u64 term = ask_lnk(mem, host);
-
-    printf("%llu reduce ", mem->tid); debug_print_lnk(term); printf(" (%llu)\n", init);
     //printf("------\n");
     //printf("reducing: host=%d size=%llu init=%llu ", host, stack.size, init); debug_print_lnk(term); printf("\n");
     //for (u64 i = 0; i < 256; ++i) {
@@ -579,45 +565,126 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
       switch (get_tag(term)) {
         case APP: {
           stk_push(&stack, host);
-          //stack[size++] = host;
           host = get_loc(term, 0);
           continue;
         }
         case DP0: case DP1: {
-          u64 bind = ask_arg(mem, term, get_tag(term) == DP0 ? 0 : 1);
-          if (get_tag(bind) != ARG) {
-            printf("dup-sub\n");
-            link(mem, host, bind);
-            clear(mem, get_loc(term, 0), 1);
+          // possibilidades:
+          // - apontando pra um dup node sem dono:
+          //   - marca tid como dona do dup node
+          //   - adiciona host ao stack, vai para expr
+          // - apontando pra um dup node com dono:
+          //   - espera até o dup node ser free'd
+          //
+          // um dup node é freed quando ele acaba de se processado.
+          // isso significa tanto que ele pode ter passado por uma dup-??? rule,
+          // ou que ele ficou stuck em uma variável. algo que pode acontecer é
+          // uma thread lockar um dup node, tentar reduzir, 
+          //
+          // - apontando pra um dup node com dono:
+          //   - se for o dono, 
+          //
+          //
+          //  dup a b = $x; (Foo a ((λ$x 7) 8) b)
+          //
+          //  (Foo (dup a b = $x; (Pair a b)) ((λ$x 8) (+ 2 2)))
+          //  uma variável pode fazer parte de outra thread, porém, diferente do
+          //  dup node, não é possível a thread "lockar" o lambda (como faria
+          //  com o dup) e ir reduzí-lo, já que o lambda não possui uma aresta
+          //  para o pai. a thread pode, porém, lockar para leitura. isso é
+          //  importante, pois, caso esse lambda esteja no processo de substituir
+          //  essa variável por algo que está sendo construído, haveria o risco
+          //  do var-sub trazer um termo incompleto.
+          //
+          //  o problema da sincronização, portanto, tem sua origem no fato de
+          //  que regras de redução realizam subst()'s, sendo que cada um destes
+          //  muda algo que é visível a uma outra thread. o fato de que o
+          //  subst() agora deixa de "invadir" o espaço de uma thread vizinha
+          //  (pois, com as regras var-sub, dp0-sub e dp1-sub, não mais este
+          //  sobrescreve regiões de outras threads), resolve o problema de um
+          //  subst() tentar escrever em cima de uma variável que não mais está
+          //  lá, ou seja, que foi movida por outra thread. sendo assim, a
+          //  thread que é "dona" do var/dp0/dp1 é responsável por fazer esse
+          //  conexão final, e não a thread que chama o subst(). porém, ainda há
+          //  a possibilidade de essa conexão final ser feita *antes* da thread
+          //  que chamou o subst() concluir a respectiva regra de reescrita, o
+          //  que resultaria na thread da variável receber uma estrutura
+          //  incompleta - e, pior, começar a alterá-la antes da thread original
+          //  completar a regra de reescrita!
+          //
+          //  sendo assim, variáveis são como pontes para dados cujos donos são
+          //  outras threads; e, sob essa ótica, subst() é uma operação capaz de
+          //  mover dados entre duas threads. para que isso funcione de forma
+          //  consistente, é necessário um protocolo de comunicação e
+          //  sincronização, sendo LAM e DUP nodes os pontos de orquestração.
+          //
+          //  - a operação de subst tem que realizar um atomic_store com memory_order_release
+          //
+          //  - acessar um var/dp0/dp1 precisa realizar um atomic_load com memory_order_acquire
+          //
+          //  no caso de LAM/VAR, a thread lendo a variável não pode fazer nada
+          //  a respeito da redução do LAM. sendo assim, ou ela observa uma
+          //  variável ligada a um ARG (portanto, parte de um LAM não reduzido),
+          //  ou ela observa uma variável ligada um termo já completamente
+          //  construído, graças à semântica release-acquire (portanto, um
+          //  termo que foi *movido* de uma outra thread para essa)
+          //
+          //  no caso de DUP/DP0/DP1, a thread lendo a variável parte,
+          //  ativamente, em direção à expr, para então reduzir o DUP ela mesma.
+          //  é necessário evitar que duas threads atravessem o mesmo DUP node
+          //  em direção a uma expressão, caso contrário, aconteceria de um
+          //  mesmo dado ser pertencente a duas threads distintas. 
+          //
+          //  no caso, o lock de um dup node é usado como forma de evitar que
+          //  uma thread atravesse ele, sem nenhuma relação com a sincronização
+          //  da operação de substituíção. especificamente, queremos evitar que
+          //  duas threads avancem para o mesmo expr. sendo assim, é necessário
+          //  lockar o dup node antes de realizar qualquer leitura sobre ele.
+          //  estando esse lockado, podemos então descobrir se é de fato um dup
+          //  node, ou se já foi reduzido.
+          //
+          //  e quanto ao clear? o clear de um lam node deve ser feito
+          //  imediatamente após o lam-sub. o clear de um dup node deve ser
+          //  feito apenas o segundo dup-sub, isso é, quando ambos os args já
+          //  foram movidos para suas respectivas threads.
+          //
+          //  - adicionar um assert no ask_lnk para descobrir se ele é chamado com VAR/DP0/DP1
+          
+          #ifdef PARALLEL
+          flg* lock_flg = &mem->lock[get_loc(term, 0)];
+          if (atomic_flag_test_and_set(lock_flg) != 0) {
             continue;
-          } else {
-            #ifdef PARALLEL
-            u64 lock_loc = get_loc(term, 0);
-            flg lock_flg = mem->lock[lock_loc];
-            if (atomic_flag_test_and_set(&lock_flg) != 0) {
-              printf("%llu couldn't lock %llu\n", mem->tid, lock_loc);
-              init = 1;
-              exit(0);
-              continue;
-            }
-            if (ask_lnk(mem, host) != term) {
-              printf("%llu bad %llu\n", mem->tid, lock_loc);
-              exit(0);
-            }
-            ++locks;
-            printf("%llu locks %llu\n", mem->tid, lock_loc);
-            #endif
+          }
+          #endif
+          Ptr bind_arg = atomic_ask_arg(mem, term, get_tag(term) == DP0 ? 0 : 1);
+          if (get_tag(bind_arg) == ARG) {
             stk_push(&stack, host);
             host = get_loc(term, 2);
             continue;
+          } else {
+            link(mem, host, bind_arg);
+            clear(mem, get_loc(term, 0), 1);
+            #ifdef PARALLEL
+            atomic_flag_clear(lock_flg);
+            #endif
+            continue;
           }
+        }
+        case VAR: {
+          Ptr bind = atomic_ask_arg(mem, term, 0);
+          printf("VAR %llu\n", get_tag(bind));
+          if (get_tag(bind) != ARG && get_tag(bind) != ERA) {
+            //printf("var-sub\n");
+            link(mem, host, bind);
+            clear(mem, get_loc(term, 0), 1);
+            continue;
+          }
+          break;
         }
         case OP2: {
           if (slen == 1 || stack.size > 0) {
             stk_push(&stack, host);
             stk_push(&stack, get_loc(term, 0) | 0x80000000);
-            //stack[size++] = host;
-            //stack[size++] = get_loc(term, 0) | 0x80000000;
             host = get_loc(term, 1);
             continue;
           }
@@ -636,23 +703,13 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
 
           break;
         }
-        case VAR: {
-          u64 bind = ask_arg(mem, term, 0);
-          if (get_tag(bind) != ARG) {
-            printf("var-sub\n");
-            link(mem, host, bind);
-            clear(mem, get_loc(term, 0), 1);
-            continue;
-          }
-          break;
-        }
       }
 
     } else {
 
       switch (get_tag(term)) {
         case APP: {
-          u64 arg0 = ask_arg(mem, term, 0);
+          Ptr arg0 = ask_arg(mem, term, 0);
           switch (get_tag(arg0)) {
 
             // (λx(body) a)
@@ -660,27 +717,29 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // x <- a
             // body
             case LAM: {
-              printf("%llu app-lam\n", mem->tid);
+              //printf("%llu app-lam %llu\n", mem->tid, mem->cost);
               inc_cost(mem);
+              Ptr done = link(mem, host, ask_arg(mem, arg0, 1));
               subst(mem, get_loc(arg0, 0), ask_arg(mem, term, 1));
-              u64 done = link(mem, host, ask_arg(mem, arg0, 1));
-              clear(mem, get_loc(term,0), 2);
+              clear_lam(mem, get_loc(term, 0));
               clear(mem, get_loc(arg0,0), 2);
               init = 1;
               continue;
             }
 
             // ({a b} c)
-            // ----------------- APP-PAR
+            // --------------- APP-PAR
             // dup x0 x1 = c
             // {(a x0) (b x1)}
             case PAR: {
-              printf("%llu app-sup\n", mem->tid);
+              //printf("%llu app-sup %llu\n", mem->tid, mem->cost);
               inc_cost(mem);
               u64 app0 = alloc(mem, 2); // GC: get_loc(term, 0);
               u64 app1 = alloc(mem, 2); // GC: get_loc(arg0, 0);
               u64 let0 = alloc(mem, 3);
               u64 par0 = alloc(mem, 2);
+              link(mem, let0+0, Arg(0));
+              link(mem, let0+1, Arg(0));
               link(mem, let0+2, ask_arg(mem, term, 1));
               link(mem, app0+1, Dp0(get_ext(arg0), let0));
               link(mem, app0+0, ask_arg(mem, arg0, 0));
@@ -688,8 +747,10 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
               link(mem, app1+1, Dp1(get_ext(arg0), let0));
               link(mem, par0+0, App(app0));
               link(mem, par0+1, App(app1));
-              u64 done = Par(get_ext(arg0), par0);
+              Ptr done = Par(get_ext(arg0), par0);
               link(mem, host, done);
+              clear(mem, get_loc(term, 0), 2);
+              clear(mem, get_loc(arg0, 0), 2);
               break;
             }
 
@@ -698,7 +759,7 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
         }
         case DP0:
         case DP1: {
-          u64 arg0 = ask_arg(mem, term, 2);
+          Ptr arg0 = atomic_ask_arg(mem, term, 2);
           switch (get_tag(arg0)) {
 
             // dup r s = λx(f)
@@ -708,25 +769,29 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // s <- λx1(f1)
             // x <- {x0 x1}
             case LAM: {
-              printf("%llu dup-lam\n", mem->tid);
+              //printf("%llu dup-lam %llu\n", mem->tid, mem->cost);
               inc_cost(mem);
               u64 let0 = alloc(mem, 3); // GC: get_loc(term, 0);
               u64 par0 = alloc(mem, 2); // GC: get_loc(arg0, 0);
               u64 lam0 = alloc(mem, 2);
               u64 lam1 = alloc(mem, 2);
+              link(mem, let0+0, Arg(0));
+              link(mem, let0+1, Arg(0));
               link(mem, let0+2, ask_arg(mem, arg0, 1));
               link(mem, par0+1, Var(lam1));
               link(mem, par0+0, Var(lam0));
-              subst(mem, get_loc(arg0, 0), Par(get_ext(term), par0));
+              link(mem, lam0+0, Arg(0));
               link(mem, lam0+1, Dp0(get_ext(term), let0));
-              subst(mem, get_loc(term, 0), Lam(lam0));
+              link(mem, lam1+0, Arg(0));
               link(mem, lam1+1, Dp1(get_ext(term), let0));
+              subst(mem, get_loc(term, 0), Lam(lam0));
               subst(mem, get_loc(term, 1), Lam(lam1));
-              u64 done = Lam(get_tag(term) == DP0 ? lam0 : lam1);
-              link(mem, host, done);
+              subst(mem, get_loc(arg0, 0), Par(get_ext(term), par0));
+              //Ptr done = Lam(get_tag(term) == DP0 ? lam0 : lam1);
+              //link(mem, host, done);
+              clear_dup(mem, get_loc(term, 0));
+              clear_lam(mem, get_loc(arg0, 0));
               #ifdef PARALLEL
-              --locks;
-              printf("%llu unlocks %llu\n", mem->tid, get_loc(term, 0));
               atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
               #endif
               init = 1;
@@ -745,18 +810,16 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // dup xA yA = a
             // dup xB yB = b
             case PAR: {
-              printf("%llu dup-sup\n", mem->tid);
+              //printf("%llu dup-sup %llu\n", mem->tid, mem->cost);
               if (get_ext(term) == get_ext(arg0)) {
                 inc_cost(mem);
                 subst(mem, get_loc(term, 0), ask_arg(mem, arg0, 0));
                 subst(mem, get_loc(term, 1), ask_arg(mem, arg0, 1));
-                u64 done = link(mem, host, ask_arg(mem, arg0, get_tag(term) == DP0 ? 0 : 1));
-                clear(mem, get_loc(term,0), 3);
+                //Ptr done = link(mem, host, ask_arg(mem, arg0, get_tag(term) == DP0 ? 0 : 1));
+                clear_dup(mem, get_loc(term,0));
                 clear(mem, get_loc(arg0,0), 2);
                 init = 1;
                 #ifdef PARALLEL
-                --locks;
-                printf("%llu unlocks %llu\n", mem->tid, get_loc(term, 0));
                 atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
                 #endif
                 continue;
@@ -766,16 +829,27 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
                 u64 let0 = alloc(mem, 3); // GC: get_loc(term,0);
                 u64 par1 = alloc(mem, 2); // GC: get_loc(arg0,0);
                 u64 let1 = alloc(mem, 3);
+                link(mem, let0+0, Arg(0));
+                link(mem, let0+1, Arg(0));
                 link(mem, let0+2, ask_arg(mem,arg0,0));
+                link(mem, let1+0, Arg(0));
+                link(mem, let1+1, Arg(0));
                 link(mem, let1+2, ask_arg(mem,arg0,1));
                 link(mem, par1+0, Dp1(get_ext(term),let0));
                 link(mem, par1+1, Dp1(get_ext(term),let1));
                 link(mem, par0+0, Dp0(get_ext(term),let0));
                 link(mem, par0+1, Dp0(get_ext(term),let1));
-                subst(mem, get_loc(term, 0), Par(get_ext(arg0),par0));
-                subst(mem, get_loc(term, 1), Par(get_ext(arg0),par1));
-                u64 done = Par(get_ext(arg0), get_tag(term) == DP0 ? par0 : par1);
-                link(mem, host, done);
+                subst(mem, get_loc(term, 0), Par(get_ext(arg0), par0));
+                subst(mem, get_loc(term, 1), Par(get_ext(arg0), par1));
+                clear_dup(mem, get_loc(term,0));
+                clear(mem, get_loc(arg0,0), 2);
+                init = 1;
+                #ifdef PARALLEL
+                atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
+                #endif
+                continue;
+                //Ptr done = Par(get_ext(arg0), get_tag(term) == DP0 ? par0 : par1);
+                //link(mem, host, done);
               }
               break;
             }
@@ -786,14 +860,19 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // y <- N
             // ~
             case NUM: {
-              printf("%llu dup-u32\n", mem->tid);
+              //printf("%llu dup-u32 %llu\n", mem->tid, mem->cost);
               inc_cost(mem);
               subst(mem, get_loc(term, 0), arg0);
               subst(mem, get_loc(term, 1), arg0);
-              clear(mem, get_loc(term,0), 3);
-              u64 done = arg0;
-              link(mem, host, arg0);
-              break;
+              clear_dup(mem, get_loc(term,0));
+              init = 1;
+              #ifdef PARALLEL
+              atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
+              #endif
+              continue;
+              //Ptr done = arg0;
+              //link(mem, host, arg0);
+              //break;
             }
 
             // dup x y = (K a b c ...)
@@ -805,34 +884,45 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             // x <- (K a0 b0 c0 ...)
             // y <- (K a1 b1 c1 ...)
             case CTR: {
-              printf("%llu dup-ctr\n", mem->tid);
+              //printf("%llu dup-ctr %llu\n", mem->tid, mem->cost);
               inc_cost(mem);
               u64 func = get_ext(arg0);
               u64 arit = ask_ari(mem, arg0);
               if (arit == 0) {
                 subst(mem, get_loc(term, 0), Ctr(0, func, 0));
                 subst(mem, get_loc(term, 1), Ctr(0, func, 0));
-                clear(mem, get_loc(term,0), 3);
-                u64 done = link(mem, host, Ctr(0, func, 0));
+                clear_dup(mem, get_loc(term,0));
+                //Ptr done = link(mem, host, Ctr(0, func, 0));
               } else {
                 u64 ctr0 = alloc(mem, arit); // GC: get_loc(arg0,0);
                 u64 ctr1 = alloc(mem, arit);
                 for (u64 i = 0; i < arit - 1; ++i) {
                   u64 leti = alloc(mem, 3);
+                  link(mem, leti+0, Arg(0));
+                  link(mem, leti+1, Arg(0));
                   link(mem, leti+2, ask_arg(mem, arg0, i));
                   link(mem, ctr0+i, Dp0(get_ext(term), leti));
                   link(mem, ctr1+i, Dp1(get_ext(term), leti));
                 }
                 u64 leti = alloc(mem, 3); // GC: get_loc(term, 0);
+                link(mem, leti + 0, Arg(0));
+                link(mem, leti + 1, Arg(0));
                 link(mem, leti + 2, ask_arg(mem, arg0, arit - 1));
                 link(mem, ctr0 + arit - 1, Dp0(get_ext(term), leti));
-                subst(mem, get_loc(term, 0), Ctr(arit, func, ctr0));
                 link(mem, ctr1 + arit - 1, Dp1(get_ext(term), leti));
+                subst(mem, get_loc(term, 0), Ctr(arit, func, ctr0));
                 subst(mem, get_loc(term, 1), Ctr(arit, func, ctr1));
-                u64 done = Ctr(arit, func, get_tag(term) == DP0 ? ctr0 : ctr1);
-                link(mem, host, done);
+                clear(mem, get_loc(arg0, 0), arit);
+                clear_dup(mem, get_loc(term, 0));
+                //Ptr done = Ctr(arit, func, get_tag(term) == DP0 ? ctr0 : ctr1);
+                //link(mem, host, done);
               }
-              break;
+              init = 1;
+              #ifdef PARALLEL
+              atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
+              #endif
+              continue;
+              //break;
             }
 
             // dup x y = *
@@ -843,35 +933,31 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
               inc_cost(mem);
               subst(mem, get_loc(term, 0), Era());
               subst(mem, get_loc(term, 1), Era());
-              link(mem, host, Era());
-              clear(mem, get_loc(term, 0), 3);
+              //Ptr done = link(mem, host, Era());
+              clear_dup(mem, get_loc(term, 0));
+              init = 1;
               #ifdef PARALLEL
-              --locks;
-              printf("%llu unlocks %llu\n", mem->tid, get_loc(term, 0));
               atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
               #endif
-              init = 1;
               continue;
             }
 
           }
 
           #ifdef PARALLEL
-          --locks;
-          printf("%llu unlocks %llu\n", mem->tid, get_loc(term, 0));
           atomic_flag_clear(&mem->lock[get_loc(term, 0)]);
           #endif
           break;
         }
         case OP2: {
-          u64 arg0 = ask_arg(mem, term, 0);
-          u64 arg1 = ask_arg(mem, term, 1);
+          Ptr arg0 = ask_arg(mem, term, 0);
+          Ptr arg1 = ask_arg(mem, term, 1);
 
           // (+ a b)
           // --------- OP2-NUM
           // add(a, b)
           if (get_tag(arg0) == NUM && get_tag(arg1) == NUM) {
-            printf("%llu op2-u32\n", mem->tid);
+            //printf("%llu op2-u32 %llu\n", mem->tid, mem->cost);
             inc_cost(mem);
             u64 a = get_num(arg0);
             u64 b = get_num(arg1);
@@ -894,22 +980,24 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
               case GTN: c = (a >  b) ? 1 : 0;    break;
               case NEQ: c = (a != b) ? 1 : 0;    break;
             }
-            u64 done = Num(c);
+            Ptr done = Num(c);
             clear(mem, get_loc(term,0), 2);
             link(mem, host, done);
           }
 
           // (+ {a0 a1} b)
           // --------------------- OP2-SUP-0
-          // let b0 b1 = b
+          // dup b0 b1 = b
           // {(+ a0 b0) (+ a1 b1)}
           else if (get_tag(arg0) == PAR) {
-            printf("%llu op2-sup-0\n", mem->tid);
+            //printf("%llu op2-sup-0 %llu\n", mem->tid, mem->cost);
             inc_cost(mem);
             u64 op20 = alloc(mem, 2); // GC: get_loc(term, 0);
             u64 op21 = alloc(mem, 2); // GC: get_loc(arg0, 0);
             u64 let0 = alloc(mem, 3);
             u64 par0 = alloc(mem, 2);
+            link(mem, let0+0, Arg(0));
+            link(mem, let0+1, Arg(0));
             link(mem, let0+2, arg1);
             link(mem, op20+1, Dp0(get_ext(arg0), let0));
             link(mem, op20+0, ask_arg(mem, arg0, 0));
@@ -917,7 +1005,7 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             link(mem, op21+1, Dp1(get_ext(arg0), let0));
             link(mem, par0+0, Op2(get_ext(term), op20));
             link(mem, par0+1, Op2(get_ext(term), op21));
-            u64 done = Par(get_ext(arg0), par0);
+            Ptr done = Par(get_ext(arg0), par0);
             link(mem, host, done);
           }
 
@@ -926,12 +1014,14 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
           // dup a0 a1 = a
           // {(+ a0 b0) (+ a1 b1)}
           else if (get_tag(arg1) == PAR) {
-            printf("%llu op2-sup-1\n", mem->tid);
+            //printf("%llu op2-sup-1 %llu\n", mem->tid, mem->cost);
             inc_cost(mem);
             u64 op20 = alloc(mem, 2); // GC: get_loc(term, 0);
             u64 op21 = alloc(mem, 2); // GC: get_loc(arg1, 0);
             u64 let0 = alloc(mem, 3);
             u64 par0 = alloc(mem, 2);
+            link(mem, let0+0, Arg(0));
+            link(mem, let0+1, Arg(0));
             link(mem, let0+2, arg0);
             link(mem, op20+0, Dp0(get_ext(arg1), let0));
             link(mem, op20+1, ask_arg(mem, arg1, 0));
@@ -939,7 +1029,7 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
             link(mem, op21+0, Dp1(get_ext(arg1), let0));
             link(mem, par0+0, Op2(get_ext(term), op20));
             link(mem, par0+1, Op2(get_ext(term), op21));
-            u64 done = Par(get_ext(arg1), par0);
+            Ptr done = Par(get_ext(arg1), par0);
             link(mem, host, done);
           }
 
@@ -971,8 +1061,6 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
     }
 
   }
-
-  printf("%llu returns locks=%llu\n", mem->tid, locks);
 
   return ask_lnk(mem, root);
 }
@@ -1057,13 +1145,14 @@ Ptr normal_go(Worker* mem, u64 host, u64 sidx, u64 slen) {
       u64 space = slen / rec_size;
 
       for (u64 i = 1; i < rec_size; ++i) {
-        //printf("spawn %llu %llu\n", sidx + i * space, space);
         normal_fork(sidx + i * space, rec_locs[i], sidx + i * space, space);
       }
 
       link(mem, rec_locs[0], normal_go(mem, rec_locs[0], sidx, space));
+      //printf("M!\n");
 
       for (u64 i = 1; i < rec_size; ++i) {
+        //printf("%llu joins %llu %llu\n", mem->tid, sidx + i * space, space);
         link(mem, get_loc(term, i), normal_join(sidx + i * space));
       }
 
@@ -1093,10 +1182,13 @@ Ptr normal(Worker* mem, u64 host, u64 sidx, u64 slen) {
   // 2 layers as CTRs, allowing normal() to parallelize them. So, in order to finish the reduction,
   // we call `normal_go()` a second time, with no thread space, to eliminate lasting redexes.
   normal_init();
+  //printf("normal init...\n");
   normal_go(mem, host, sidx, slen);
-  u64 done;
+  //printf("normal done...\n");
+  Ptr done;
   u64 cost = mem->cost;
   while (1) {
+    //printf("normal again...");
     normal_init();
     done = normal_go(mem, host, 0, 1);
     if (mem->cost != cost) {
@@ -1117,7 +1209,7 @@ Ptr normal(Worker* mem, u64 host, u64 sidx, u64 slen) {
 // many cases. A better task scheduler should be implemented. See Issues.
 void normal_fork(u64 tid, u64 host, u64 sidx, u64 slen) {
   pthread_mutex_lock(&workers[tid].has_work_mutex);
-  workers[tid].has_work = (sidx << 48) | (slen << 32) | host;
+  atomic_store(&workers[tid].has_work, (sidx << 48) | (slen << 32) | host);
   pthread_cond_signal(&workers[tid].has_work_signal);
   pthread_mutex_unlock(&workers[tid].has_work_mutex);
 }
@@ -1126,11 +1218,11 @@ void normal_fork(u64 tid, u64 host, u64 sidx, u64 slen) {
 u64 normal_join(u64 tid) {
   while (1) {
     pthread_mutex_lock(&workers[tid].has_result_mutex);
-    while (workers[tid].has_result == -1) {
+    while (atomic_load(&workers[tid].has_result) == -1) {
       pthread_cond_wait(&workers[tid].has_result_signal, &workers[tid].has_result_mutex);
     }
-    u64 done = workers[tid].has_result;
-    workers[tid].has_result = -1;
+    u64 done = atomic_load(&workers[tid].has_result);
+    atomic_store(&workers[tid].has_result, -1);
     pthread_mutex_unlock(&workers[tid].has_result_mutex);
     return done;
   }
@@ -1139,7 +1231,7 @@ u64 normal_join(u64 tid) {
 // Stops a worker
 void worker_stop(u64 tid) {
   pthread_mutex_lock(&workers[tid].has_work_mutex);
-  workers[tid].has_work = -2;
+  atomic_store(&workers[tid].has_work, -2);
   pthread_cond_signal(&workers[tid].has_work_signal);
   pthread_mutex_unlock(&workers[tid].has_work_mutex);
 }
@@ -1149,19 +1241,22 @@ void *worker(void *arg) {
   u64 tid = (u64)arg;
   while (1) {
     pthread_mutex_lock(&workers[tid].has_work_mutex);
-    while (workers[tid].has_work == -1) {
+    while (atomic_load(&workers[tid].has_work) == -1) {
       pthread_cond_wait(&workers[tid].has_work_signal, &workers[tid].has_work_mutex);
     }
-    u64 work = workers[tid].has_work;
+    u64 work = atomic_load(&workers[tid].has_work);
     if (work == -2) {
       break;
     } else {
       u64 sidx = (work >> 48) & 0xFFFF;
       u64 slen = (work >> 32) & 0xFFFF;
       u64 host = (work >>  0) & 0xFFFFFFFF;
-      workers[tid].has_result = normal_go(&workers[tid], host, sidx, slen);
-      workers[tid].has_work = -1;
+      Ptr done = normal_go(&workers[tid], host, sidx, slen);
+      atomic_store(&workers[tid].has_result, done);
+      atomic_store(&workers[tid].has_work, -1);
+      pthread_mutex_lock(&workers[tid].has_result_mutex);
       pthread_cond_signal(&workers[tid].has_result_signal);
+      pthread_mutex_unlock(&workers[tid].has_result_mutex);
       pthread_mutex_unlock(&workers[tid].has_work_mutex);
     }
   }
@@ -1183,7 +1278,7 @@ void ffi_normal(u8* mem_data, u32 mem_size, u32 host) {
   for (u64 t = 0; t < MAX_WORKERS; ++t) {
     workers[t].tid = t;
     workers[t].size = t == 0 ? (u64)mem_size : 0l;
-    workers[t].node = (u64*)mem_data;
+    workers[t].node = (Ptr*)mem_data;
     for (u64 a = 0; a < MAX_ARITY; ++a) {
       stk_init(&workers[t].free[a]);
     }
@@ -1191,10 +1286,10 @@ void ffi_normal(u8* mem_data, u32 mem_size, u32 host) {
     workers[t].dups = MAX_DUPS * t / MAX_WORKERS;
     #ifdef PARALLEL
     workers[t].lock = (flg*)mem_lock;
-    workers[t].has_work = -1;
+    atomic_store(&workers[t].has_work, -1);
     pthread_mutex_init(&workers[t].has_work_mutex, NULL);
     pthread_cond_init(&workers[t].has_work_signal, NULL);
-    workers[t].has_result = -1;
+    atomic_store(&workers[t].has_result, -1);
     pthread_mutex_init(&workers[t].has_result_mutex, NULL);
     pthread_cond_init(&workers[t].has_result_signal, NULL);
     // workers[t].thread = NULL;
@@ -1258,41 +1353,41 @@ void readback_vars(Stk* vars, Worker* mem, Ptr term, Stk* seen) {
     stk_push(seen, term);
     switch (get_tag(term)) {
       case LAM: {
-        u64 argm = ask_arg(mem, term, 0);
-        u64 body = ask_arg(mem, term, 1);
+        Ptr argm = ask_arg(mem, term, 0);
+        Ptr body = ask_arg(mem, term, 1);
         if (get_tag(argm) != ERA) {
-          stk_push(vars, Var(get_loc(term, 0)));
+          stk_push(vars, get_loc(term, 0));
         };
         readback_vars(vars, mem, body, seen);
         break;
       }
       case APP: {
-        u64 lam = ask_arg(mem, term, 0);
-        u64 arg = ask_arg(mem, term, 1);
+        Ptr lam = ask_arg(mem, term, 0);
+        Ptr arg = ask_arg(mem, term, 1);
         readback_vars(vars, mem, lam, seen);
         readback_vars(vars, mem, arg, seen);
         break;
       }
       case PAR: {
-        u64 arg0 = ask_arg(mem, term, 0);
-        u64 arg1 = ask_arg(mem, term, 1);
+        Ptr arg0 = ask_arg(mem, term, 0);
+        Ptr arg1 = ask_arg(mem, term, 1);
         readback_vars(vars, mem, arg0, seen);
         readback_vars(vars, mem, arg1, seen);
         break;
       }
       case DP0: {
-        u64 arg = ask_arg(mem, term, 2);
+        Ptr arg = atomic_ask_arg(mem, term, 2);
         readback_vars(vars, mem, arg, seen);
         break;
       }
       case DP1: {
-        u64 arg = ask_arg(mem, term, 2);
+        Ptr arg = atomic_ask_arg(mem, term, 2);
         readback_vars(vars, mem, arg, seen);
         break;
       }
       case OP2: {
-        u64 arg0 = ask_arg(mem, term, 0);
-        u64 arg1 = ask_arg(mem, term, 1);
+        Ptr arg0 = ask_arg(mem, term, 0);
+        Ptr arg1 = ask_arg(mem, term, 1);
         readback_vars(vars, mem, arg0, seen);
         readback_vars(vars, mem, arg1, seen);
         break;
@@ -1333,7 +1428,7 @@ void readback_term(Stk* chrs, Worker* mem, Ptr term, Stk* vars, Stk* dirs, char*
         stk_push(chrs, '_');
       } else {
         stk_push(chrs, 'x');
-        readback_decimal(chrs, stk_find(vars, Var(get_loc(term, 0))));
+        readback_decimal(chrs, stk_find(vars, get_loc(term, 0)));
       };
       stk_push(chrs, ' ');
       readback_term(chrs, mem, ask_arg(mem, term, 1), vars, dirs, id_to_name_data, id_to_name_mcap);
@@ -1369,9 +1464,9 @@ void readback_term(Stk* chrs, Worker* mem, Ptr term, Stk* vars, Stk* dirs, char*
     }
     case DP0: case DP1: {
       u64 col = get_ext(term);
-      u64 val = ask_arg(mem, term, 2);
+      Ptr val = atomic_ask_arg(mem, term, 2);
       stk_push(&dirs[col], get_tag(term) == DP0 ? 0 : 1);
-      readback_term(chrs, mem, ask_arg(mem, term, 2), vars, dirs, id_to_name_data, id_to_name_mcap);
+      readback_term(chrs, mem, atomic_ask_arg(mem, term, 2), vars, dirs, id_to_name_data, id_to_name_mcap);
       stk_pop(&dirs[col]);
       break;
     }
@@ -1533,7 +1628,7 @@ int main(int argc, char* argv[]) {
 
   // Builds main term
   mem.size = 0;
-  mem.node = (u64*)malloc(HEAP_SIZE);
+  mem.node = (Ptr*)malloc(HEAP_SIZE);
   #ifdef PARALLEL
   mem.lock = (flg*)malloc(LOCK_SIZE);
   #endif
@@ -1549,11 +1644,6 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  #ifdef LOG
-  log_size = 0;
-  log_data = (Log*)malloc(LOG_SIZE);
-  #endif
-
   for (u64 tid = 0; tid < MAX_WORKERS; ++tid) {
     workers[tid].aris = id_to_arity_data;
     workers[tid].funs = id_to_arity_size;
@@ -1568,6 +1658,7 @@ int main(int argc, char* argv[]) {
   ffi_normal((u8*)mem.node, mem.size, 0);
   #endif
   gettimeofday(&stop, NULL);
+  //printf("Reduced.\n");
 
   // Prints result statistics
   u64 delta_time = (stop.tv_sec - start.tv_sec) * 1000000 + stop.tv_usec - start.tv_usec;
@@ -1588,27 +1679,4 @@ int main(int argc, char* argv[]) {
   // Cleanup
   free(code_data);
   free(mem.node);
-
-  #ifdef LOG
-  //if (log_size >= LOG_FAIL_INDEX) {
-    //printf("LOG = [\n");
-    //for (u64 i = 0; i < log_size; ++i) {
-      //printf("  ['0x%llx','0x%llx','0x%llx','0x%llx','0x%llx'],\n", i, log_data[i].x0, log_data[i].x1, log_data[i].x2, log_data[i].x3);
-    //}
-    //printf("];\n");
-
-    //printf("NAME = {\n");
-    //for (u64 i = 0; i < id_to_name_size; ++i) {
-      //printf("  %llu: '%s',\n", i, id_to_name_data[i]);
-    //}
-    //printf("};\n");
-
-    //printf("ARITY = {\n");
-    //for (u64 i = 0; i < id_to_arity_size; ++i) {
-      //printf("  %llu: %llu,\n", i, id_to_arity_data[i]);
-    //}
-    //printf("};\n");
-    //printf("// failed\n");
-  //}
-  #endif
 }

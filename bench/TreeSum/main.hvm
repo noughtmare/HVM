@@ -7,4 +7,4 @@
 (Sum (Node a b)) = (+ (Sum a) (Sum b))
 
 // Performs 2^n additions
-(Main n) = (Sum (Gen n))
+(Main n) = (Sum (Gen 26))

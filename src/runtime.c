@@ -85,11 +85,7 @@ void err() {
 // Some links deal with variables: DP0, DP1, VAR, ARG and ERA.  The OP2 link
 // represents a numeric operation, and NUM and FLO links represent unboxed nums.
 
-#ifdef PARALLEL
-typedef a64 Ptr;
-#else
 typedef u64 Ptr;
-#endif
 void debug_print_lnk(Ptr x);
 
 #define VAL ((u64) 1)
@@ -343,7 +339,7 @@ Ptr ask_arg(Worker* mem, Ptr term, u64 arg) {
 // Gets what is stored on the location, atomically
 Ptr atomic_ask_lnk(Worker* mem, u64 loc) {
   #ifdef PARALLEL
-  return atomic_load_explicit(&mem->node[loc], memory_order_acquire); // FIXME: add memory_order
+  return atomic_load_explicit((a64*)&mem->node[loc], memory_order_acquire); // FIXME: add memory_order
   #else
   return mem->node[loc];
   #endif
@@ -385,7 +381,7 @@ Ptr link(Worker* mem, u64 loc, Ptr lnk) {
 // Interts a value in another, atomically.
 Ptr atomic_link(Worker* mem, u64 loc, Ptr lnk) {
   #ifdef PARALLEL
-  atomic_store_explicit(&mem->node[loc], lnk, memory_order_release);
+  atomic_store_explicit((a64*)&mem->node[loc], lnk, memory_order_release);
   #else
   mem->node[loc] = lnk;
   #endif
@@ -424,7 +420,7 @@ void collect(Worker* mem, Ptr term) {
       u64 arg_loc = get_loc(term, get_tag(term) == DP1 ? 1 : 0);
       #ifdef PARALLEL
       u64 arg_val = (ARG*TAG); // FIXME: should Ptr be just u64?
-      if (!atomic_compare_exchange_strong(&mem->node[arg_loc], &arg_val, (ERA*TAG))) {
+      if (!atomic_compare_exchange_strong((a64*)&mem->node[arg_loc], &arg_val, (ERA*TAG))) {
         collect(mem, arg_val);
       }
       #else
@@ -1155,7 +1151,6 @@ Ptr normal_go(Worker* mem, u64 host, u64 sidx, u64 slen) {
       u64 space = slen / rec_size;
 
       for (u64 i = 1; i < rec_size; ++i) {
-        printf("%llu spawns %llu\n", mem->tid, sidx + i * space);
         normal_fork(sidx + i * space, rec_locs[i], sidx + i * space, space);
       }
 
@@ -1229,11 +1224,11 @@ void normal_fork(u64 tid, u64 host, u64 sidx, u64 slen) {
 u64 normal_join(u64 tid) {
   while (1) {
     pthread_mutex_lock(&workers[tid].has_result_mutex);
-    while (atomic_load(&workers[tid].has_result) == -1) {
+    while (workers[tid].has_result == -1) {
       pthread_cond_wait(&workers[tid].has_result_signal, &workers[tid].has_result_mutex);
     }
-    u64 done = atomic_load(&workers[tid].has_result);
-    atomic_store(&workers[tid].has_result, -1);
+    u64 done = workers[tid].has_result;
+    workers[tid].has_result = -1;
     pthread_mutex_unlock(&workers[tid].has_result_mutex);
     return done;
   }
@@ -1242,7 +1237,7 @@ u64 normal_join(u64 tid) {
 // Stops a worker
 void worker_stop(u64 tid) {
   pthread_mutex_lock(&workers[tid].has_work_mutex);
-  atomic_store(&workers[tid].has_work, -2);
+  workers[tid].has_work = -2;
   pthread_cond_signal(&workers[tid].has_work_signal);
   pthread_mutex_unlock(&workers[tid].has_work_mutex);
 }
@@ -1252,7 +1247,7 @@ void *worker(void *arg) {
   u64 tid = (u64)arg;
   while (1) {
     pthread_mutex_lock(&workers[tid].has_work_mutex);
-    while (atomic_load(&workers[tid].has_work) == -1) {
+    while (workers[tid].has_work == -1) {
       pthread_cond_wait(&workers[tid].has_work_signal, &workers[tid].has_work_mutex);
     }
     u64 work = atomic_load(&workers[tid].has_work);
@@ -1263,8 +1258,8 @@ void *worker(void *arg) {
       u64 slen = (work >> 32) & 0xFFFF;
       u64 host = (work >>  0) & 0xFFFFFFFF;
       Ptr done = normal_go(&workers[tid], host, sidx, slen);
-      atomic_store(&workers[tid].has_result, done);
-      atomic_store(&workers[tid].has_work, -1);
+      workers[tid].has_result = done;
+      workers[tid].has_work = -1;
       pthread_mutex_lock(&workers[tid].has_result_mutex);
       pthread_cond_signal(&workers[tid].has_result_signal);
       pthread_mutex_unlock(&workers[tid].has_result_mutex);
@@ -1297,10 +1292,10 @@ void ffi_normal(u8* mem_data, u32 mem_size, u32 host) {
     workers[t].dups = MAX_DUPS * t / MAX_WORKERS;
     #ifdef PARALLEL
     workers[t].lock = (flg*)mem_lock;
-    atomic_store(&workers[t].has_work, -1);
+    workers[t].has_work = -1;
     pthread_mutex_init(&workers[t].has_work_mutex, NULL);
     pthread_cond_init(&workers[t].has_work_signal, NULL);
-    atomic_store(&workers[t].has_result, -1);
+    workers[t].has_result = -1;
     pthread_mutex_init(&workers[t].has_result_mutex, NULL);
     pthread_cond_init(&workers[t].has_result_signal, NULL);
     // workers[t].thread = NULL;

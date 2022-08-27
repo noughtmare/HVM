@@ -25,10 +25,9 @@
 //(Pair a b) = (PAIR a b)
 (Foo x) = (Bar x x)
 
-//Main = (Fib 10000)
-//Main = (Fib 10)
+Main = (Fib 1000000)
 
-Main = (λfλx(f (f x)) λfλx(f (f x)))
+//Main = (λfλx(f (f x)) λfλx(f (f x)))
 
 //(Main n) = (λxλy(y) λz(Foo z) 8)
 

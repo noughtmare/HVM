@@ -12,7 +12,7 @@
 
 /*! GENERATED_PARALLEL_FLAG !*/
 
-#undef PARALLEL
+//#undef PARALLEL
 
 #ifdef PARALLEL
 #include <pthread.h>
@@ -343,7 +343,7 @@ Ptr ask_arg(Worker* mem, Ptr term, u64 arg) {
 // Gets what is stored on the location, atomically
 Ptr atomic_ask_lnk(Worker* mem, u64 loc) {
   #ifdef PARALLEL
-  return atomic_load(&mem->node[loc]); // FIXME: add memory_order
+  return atomic_load_explicit(&mem->node[loc], memory_order_acquire); // FIXME: add memory_order
   #else
   return mem->node[loc];
   #endif
@@ -361,22 +361,35 @@ Ptr atomic_ask_arg(Worker* mem, Ptr term, u64 arg) {
 
 // Frees a block of memory by adding its position a freelist
 void clear(Worker* mem, u64 loc, u64 size) {
-  //stk_push(&mem->free[size], loc);
+  stk_push(&mem->free[size], loc);
 }
 
 void clear_lam(Worker* mem, u64 loc) {
-  // FIXME: uncomment
-  //if (get_tag(atomic_ask_lnk(get_loc(arg0, 0))) == ERA) {
-    //clear(mem, get_loc(term,0), 2);
-  //}
+  if (get_tag(atomic_ask_lnk(mem, loc)) == ERA) {
+    clear(mem, loc, 2);
+  }
 }
 
 void clear_dup(Worker* mem, u64 loc) {
+  if ( get_tag(atomic_ask_lnk(mem, loc+0)) == ERA
+    && get_tag(atomic_ask_lnk(mem, loc+1)) == ERA) {
+    clear(mem, loc, 3);
+  }
 }
 
 // Inserts a value in another.
 Ptr link(Worker* mem, u64 loc, Ptr lnk) {
   return mem->node[loc] = lnk;
+}
+
+// Interts a value in another, atomically.
+Ptr atomic_link(Worker* mem, u64 loc, Ptr lnk) {
+  #ifdef PARALLEL
+  atomic_store_explicit(&mem->node[loc], lnk, memory_order_release);
+  #else
+  mem->node[loc] = lnk;
+  #endif
+  return lnk;
 }
 
 // Allocates a block of memory, up to 16 words long
@@ -406,7 +419,6 @@ u64 alloc(Worker* mem, u64 size) {
 // uncommenting the `reduce` lines below, but this would make HVM not 100% lazy
 // in some cases, so it should be called in a separate thread.
 void collect(Worker* mem, Ptr term) {
-  return;
   switch (get_tag(term)) {
     case VAR: case DP0: case DP1: {
       u64 arg_loc = get_loc(term, get_tag(term) == DP1 ? 1 : 0);
@@ -486,13 +498,7 @@ u64 gen_dupk(Worker* mem) {
 void subst(Worker* mem, u64 var, Ptr ptr) {
   Ptr lnk = atomic_ask_lnk(mem, var);
   if (get_tag(lnk) != ERA) {
-    //printf("set %llu = ", var); debug_print_lnk(ptr); printf("\n");
-    #ifdef PARALLEL
-    atomic_store(&mem->node[var], ptr);
-    #else
-    mem->node[var] = ptr;
-    #endif
-    //link(mem, get_loc(lnk,0), val);
+    atomic_link(mem, var, ptr);
   } else {
     collect(mem, ptr);
   }
@@ -650,20 +656,23 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
           //
           //  - adicionar um assert no ask_lnk para descobrir se ele é chamado com VAR/DP0/DP1
           
+          // TODO: clear dup
           #ifdef PARALLEL
           flg* lock_flg = &mem->lock[get_loc(term, 0)];
           if (atomic_flag_test_and_set(lock_flg) != 0) {
             continue;
           }
           #endif
-          Ptr bind_arg = atomic_ask_arg(mem, term, get_tag(term) == DP0 ? 0 : 1);
+          u64 bind_loc = get_loc(term, get_tag(term) == DP0 ? 0 : 1);
+          Ptr bind_arg = atomic_ask_lnk(mem, bind_loc);
           if (get_tag(bind_arg) == ARG) {
             stk_push(&stack, host);
             host = get_loc(term, 2);
             continue;
           } else {
             link(mem, host, bind_arg);
-            clear(mem, get_loc(term, 0), 1);
+            atomic_link(mem, bind_loc, Era());
+            clear_dup(mem, get_loc(term, 0));
             #ifdef PARALLEL
             atomic_flag_clear(lock_flg);
             #endif
@@ -671,12 +680,13 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
           }
         }
         case VAR: {
-          Ptr bind = atomic_ask_arg(mem, term, 0);
-          printf("VAR %llu\n", get_tag(bind));
-          if (get_tag(bind) != ARG && get_tag(bind) != ERA) {
-            //printf("var-sub\n");
-            link(mem, host, bind);
-            clear(mem, get_loc(term, 0), 1);
+          // TODO: clear lam
+          u64 bind_loc = get_loc(term, 0);
+          Ptr bind_arg = atomic_ask_lnk(mem, bind_loc);
+          if (get_tag(bind_arg) != ARG && get_tag(bind_arg) != ERA) {
+            link(mem, host, bind_arg);
+            atomic_link(mem, bind_loc, Era());
+            clear_lam(mem, get_loc(term, 0));
             continue;
           }
           break;
@@ -721,8 +731,8 @@ Ptr reduce(Worker* mem, u64 root, u64 slen) {
               inc_cost(mem);
               Ptr done = link(mem, host, ask_arg(mem, arg0, 1));
               subst(mem, get_loc(arg0, 0), ask_arg(mem, term, 1));
-              clear_lam(mem, get_loc(term, 0));
-              clear(mem, get_loc(arg0,0), 2);
+              clear(mem, get_loc(term, 0), 2);
+              clear_lam(mem, get_loc(arg0, 0));
               init = 1;
               continue;
             }
@@ -1145,6 +1155,7 @@ Ptr normal_go(Worker* mem, u64 host, u64 sidx, u64 slen) {
       u64 space = slen / rec_size;
 
       for (u64 i = 1; i < rec_size; ++i) {
+        printf("%llu spawns %llu\n", mem->tid, sidx + i * space);
         normal_fork(sidx + i * space, rec_locs[i], sidx + i * space, space);
       }
 

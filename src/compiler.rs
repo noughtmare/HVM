@@ -252,7 +252,7 @@ fn compile_func_rule_term(
     globs: &mut HashMap<u64, String>,
     term: &bd::DynTerm,
   ) -> String {
-    const INLINE_NUMBERS: bool = false;
+    const INLINE_NUMBERS: bool = true;
     //println!("compile {:?}", term);
     //println!("- vars: {:?}", vars);
     match term {
